@@ -1,0 +1,14 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+app/dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# ---- minisign 更新签名私钥（公钥 .pub 必须入库：CI release-gate 靠它比对拦截开发钥）----
+src-tauri/keys/*.key
+src-tauri/keys/*.key.password
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+*.local
+Thumbs.db

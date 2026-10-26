@@ -1,0 +1,160 @@
+@import 'tailwindcss';
+
+/* ---------- 主题色体系（设置 → 主题设置 可实时切换） ---------- */
+:root {
+  --accent-from: #8b5cf6;
+  --accent-to: #d946ef;
+}
+
+.bg-accent-grad {
+  background-image: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+}
+.bg-accent-grad-r {
+  background-image: linear-gradient(90deg, var(--accent-from), var(--accent-to));
+}
+.text-accent {
+  color: var(--accent-from);
+}
+.border-accent {
+  border-color: color-mix(in srgb, var(--accent-from) 35%, transparent);
+}
+.border-accent-strong {
+  border-color: color-mix(in srgb, var(--accent-from) 60%, transparent);
+}
+.bg-accent-soft {
+  background-color: color-mix(in srgb, var(--accent-from) 10%, transparent);
+}
+.hover-bg-accent-soft:hover {
+  background-color: color-mix(in srgb, var(--accent-from) 18%, transparent);
+}
+.hover-border-accent:hover {
+  border-color: color-mix(in srgb, var(--accent-from) 50%, transparent);
+}
+.hover-text-accent:hover {
+  color: var(--accent-from);
+}
+.shadow-accent {
+  box-shadow: 0 10px 30px -10px color-mix(in srgb, var(--accent-from) 55%, transparent);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family:
+    'Inter', 'HarmonyOS Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui,
+    sans-serif;
+  background:
+    radial-gradient(ellipse 60% 40% at 15% 0%, color-mix(in srgb, var(--accent-from) 13%, transparent), transparent),
+    radial-gradient(ellipse 50% 35% at 85% 10%, rgba(59, 130, 246, 0.1), transparent),
+    #09090b;
+  color: #fafafa;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 暗黑磨砂玻璃面板（Glassmorphism） */
+.glass {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(12px);
+  border-radius: 1rem;
+}
+
+.glass-hover:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: color-mix(in srgb, var(--accent-from) 35%, transparent);
+}
+
+/* alphaTab 画布在暗色主题下的容器（谱面颜色由 设置→主题设置 的音符颜色控制） */
+.at-wrap {
+  color: #e4e4e7;
+}
+
+/* 细滚动条 */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* range 滑块跟随主题色 */
+input[type='range'] {
+  accent-color: var(--accent-from);
+}
+
+/* ---------- 浅色主题（设置 → 主题设置 → 主题模式） ----------
+   通过 html.light 对界面实际使用的灰阶工具类做系统性反色映射，
+   accent / 语义色（琥珀/翠绿/玫红背景 tint）保持不变。 */
+html.light body {
+  background:
+    radial-gradient(ellipse 60% 40% at 15% 0%, color-mix(in srgb, var(--accent-from) 10%, transparent), transparent),
+    radial-gradient(ellipse 50% 35% at 85% 10%, rgba(59, 130, 246, 0.07), transparent),
+    #f4f4f5;
+  color: #18181b;
+}
+html.light .glass {
+  background: rgba(255, 255, 255, 0.72);
+  border-color: rgba(0, 0, 0, 0.08);
+}
+html.light .glass-hover:hover {
+  background: rgba(255, 255, 255, 0.92);
+}
+html.light .at-wrap {
+  color: #18181b;
+}
+html.light *::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+}
+
+/* 文字灰阶反色 */
+html.light .text-zinc-100 { color: #18181b; }
+html.light .text-zinc-200 { color: #27272a; }
+html.light .text-zinc-300 { color: #3f3f46; }
+html.light .text-zinc-400 { color: #52525b; }
+html.light .text-zinc-500 { color: #6f6f78; }
+html.light .text-zinc-600 { color: #8d8d96; }
+html.light .text-zinc-700 { color: #adadb5; }
+
+/* 面板/填充反色 */
+html.light .bg-white\/5 { background-color: rgba(0, 0, 0, 0.035); }
+html.light .bg-white\/8 { background-color: rgba(0, 0, 0, 0.05); }
+html.light .bg-white\/10 { background-color: rgba(0, 0, 0, 0.07); }
+html.light .bg-white\/15 { background-color: rgba(0, 0, 0, 0.1); }
+html.light .bg-white\/\[0\.02\] { background-color: rgba(0, 0, 0, 0.02); }
+html.light .bg-white\/\[0\.03\] { background-color: rgba(0, 0, 0, 0.03); }
+html.light .bg-white\/\[0\.06\] { background-color: rgba(0, 0, 0, 0.05); }
+html.light .bg-black\/20 { background-color: rgba(0, 0, 0, 0.04); }
+html.light .bg-black\/25 { background-color: rgba(0, 0, 0, 0.03); }
+html.light .bg-black\/30 { background-color: rgba(0, 0, 0, 0.05); }
+html.light .bg-black\/60 { background-color: rgba(24, 24, 27, 0.45); }
+html.light .bg-zinc-900\/95 { background-color: rgba(255, 255, 255, 0.97); }
+html.light .bg-zinc-700 { background-color: #d4d4d8; }
+html.light .bg-zinc-700\/60 { background-color: rgba(0, 0, 0, 0.08); }
+html.light .bg-zinc-700\/50 { background-color: rgba(0, 0, 0, 0.06); }
+
+/* 边框反色 */
+html.light .border-white\/5 { border-color: rgba(0, 0, 0, 0.05); }
+html.light .border-white\/8 { border-color: rgba(0, 0, 0, 0.07); }
+html.light .border-white\/10 { border-color: rgba(0, 0, 0, 0.09); }
+html.light .border-white\/15 { border-color: rgba(0, 0, 0, 0.13); }
+html.light .border-white\/20 { border-color: rgba(0, 0, 0, 0.17); }
+html.light .border-white\/30 { border-color: rgba(0, 0, 0, 0.25); }
+
+/* 语义提示色在浅底上加深保证可读 */
+html.light .text-amber-200 { color: #92400e; }
+html.light .text-amber-300\/90 { color: #a16207; }
+html.light .text-amber-400 { color: #b45309; }
+html.light .text-amber-400\/70 { color: #b45309; }
+html.light .text-emerald-300 { color: #047857; }
+html.light .text-emerald-300\/90 { color: #047857; }
+html.light .text-rose-300 { color: #be123c; }

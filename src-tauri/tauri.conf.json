@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI 智能扒谱",
+  "version": "0.1.0",
+  "identifier": "com.dsh.guitar",
+  "build": {
+    "frontendDist": "../app/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix app run dev",
+    "beforeBuildCommand": "npm --prefix app run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AI 智能扒谱",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 680,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-renderer-backgrounding"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self' https: ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "icon": ["icons/icon.ico"],
+    "resources": ["THIRD-PARTY-NOTICES-RUST.txt"],
+    "fileAssociations": [
+      {
+        "ext": ["agtp"],
+        "name": "com.dsh.guitar.agtp",
+        "description": "AI 智能扒谱工程文件",
+        "role": "Editor"
+      }
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"]
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkyQzU4RjQ4NzVFQUM1RjYKUldUMnhlcDFTSS9Ga21icERUWDFRRkdtckZ5aUplV1NCclF3YjRXT0RwbDFXVVlQWWlLSjM3SEQK",
+      "endpoints": [
+        "https://github.com/dsh/ai-guitar-transcriber/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

@@ -1,0 +1,139 @@
+name: release-windows
+
+# Windows 原生版发布流水线（方案 §8.5）
+# 推 tag（v*）→ 构建 → minisign 签名更新包 → Draft Release（NSIS + portable 绿色版 + latest.json）
+# 只发 NSIS 一种安装器格式——NSIS/MSI 混装会把更新装错目录（§8.1 硬规则）
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖（不给 app/package.json 加任何 tauri 依赖——CLI 走 npx/tauri-action）
+        working-directory: app
+        run: npm ci
+
+      - name: 版本三处同源校验（app/package.json = tauri.conf.json = Cargo.toml）
+        shell: bash
+        run: bash src-tauri/scripts/check-versions.sh
+
+      # ---- 首发三件套终审（§8.3/§11.2 R1+R2）：烧进二进制的 endpoint/pubkey/identifier，
+      #      占位符或开发钥检出即 fail——错过首发窗口，纠正成本 = 全体用户手动重装 ----
+      - name: 首发三件套终审（endpoint 占位符 / identifier / 开发钥拦截）
+        shell: bash
+        run: bash src-tauri/scripts/release-gate.sh
+
+      # ---- W15 基线（§10）：直建一次，记录 app 源码与 dist 产物哈希 ----
+      - name: W15 基线（app 源码哈希 + 直接构建的 dist 哈希）
+        shell: bash
+        run: |
+          find app -type f ! -path "app/node_modules/*" ! -path "app/dist/*" -print0 \
+            | sort -z | xargs -0 sha256sum > /tmp/app-src-before.sha256
+          npm --prefix app run build
+          find app/dist -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/dist-before.sha256
+
+      # ---- 手动全量构建一次（CLI 钉 2.12.4，§3.1/R5：与 CI 所用版本对齐防漂移），
+      #      在此完成验证门禁：验证不通过则整个 job 失败，不会创建任何 Release ----
+      - name: 全量构建（NSIS + 签名更新包）
+        working-directory: src-tauri
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx --yes @tauri-apps/cli@2.12.4 build
+
+      - name: W15 验证（app 零改动 + 前端产物 hash 一致）——Release 创建前的门禁
+        shell: bash
+        run: |
+          find app -type f ! -path "app/node_modules/*" ! -path "app/dist/*" -print0 \
+            | sort -z | xargs -0 sha256sum > /tmp/app-src-after.sha256
+          diff /tmp/app-src-before.sha256 /tmp/app-src-after.sha256 \
+            && echo "W15-1 OK: app/ 零改动"
+          find app/dist -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/dist-after.sha256
+          diff /tmp/dist-before.sha256 /tmp/dist-after.sha256 \
+            && echo "W15-2 OK: 装进安装器的前端与直建产物 hash 一致"
+          # 观察项（§11.1）：W15② 依赖 Vite 构建确定性；若偶发不一致，排查非确定性来源
+          # （chunk 哈希、生成时间戳等），不得借机放宽为零改动承诺。
+
+      - name: 安装包体积门禁（§10 性能门禁 / §11.2 R4：NSIS ≤ 25MB，不含模型权重）
+        shell: bash
+        run: |
+          setup=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe)
+          size=$(stat -c %s "$setup")
+          echo "NSIS 体积：$((size / 1024 / 1024)) MiB（$size 字节）"
+          if [ "$size" -gt 26214400 ]; then
+            echo "::error::安装包超过 25MB 性能门禁（§10）：$setup" >&2
+            exit 1
+          fi
+
+      # ---- 验证通过后才建 Draft Release（§8.5：action 与 CLI 均钉具体版本，防上游漂移） ----
+      - name: 构建 NSIS 安装器 + 签名更新包 + Draft Release
+        uses: tauri-apps/tauri-action@v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'AI 智能扒谱 v__VERSION__'
+          releaseBody: |
+            下载下方 assets：
+            - **NSIS 安装器**（.exe，推荐）：双击安装，支持自动更新与 .agtp 文件关联
+            - **portable 绿色版**（.zip）：解压即用，无文件关联/无自动更新
+
+            许可声明：前端 npm 依赖见 `app/THIRD-PARTY-NOTICES.txt`；Rust 壳工程依赖见仓库 `src-tauri/THIRD-PARTY-NOTICES-RUST.txt`（随安装目录一并携带）。
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+
+      # ---- Draft Release 后体积断言复验（§11.2 R4 完成标准字面要求） ----
+      - name: 体积断言复验（Draft Release 后）
+        shell: bash
+        run: |
+          size=$(stat -c %s src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [ "$size" -gt 26214400 ]; then
+            echo "::error::Draft Release 附带的安装包超过 25MB 门禁，请删除本 Draft 重新排查" >&2
+            exit 1
+          fi
+          echo "体积复验 OK：$size 字节"
+
+      # ---- portable 绿色版（§8.1 次要分发：exe 以产品名入包） ----
+      - name: 打包 portable 绿色版并附到 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $exe = Get-ChildItem 'src-tauri/target/release' -Filter '*.exe' |
+            Where-Object { $_.Name -notmatch '_script_' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { throw 'release exe not found' }
+          $stage = 'portable-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $exe.FullName (Join-Path $stage 'AI 智能扒谱.exe')
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath 'portable-windows-x64.zip' -Force
+          Remove-Item $stage -Recurse -Force
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag) { $tag = "v$(node -p "require('./app/package.json').version")" }
+          gh release upload $tag portable-windows-x64.zip --clobber
+          Write-Host "portable: portable-windows-x64.zip (from $($exe.Name))"

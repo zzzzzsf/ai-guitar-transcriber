@@ -1,0 +1,64 @@
+第三方开源组件声明（THIRD-PARTY NOTICES）
+==========================================
+
+本项目主程序采用 MIT 协议。以下为运行时集成的第三方组件及其许可声明，
+各组件的完整许可文本可在其源码仓库或 node_modules 对应包内找到。
+
+1. alphaTab (@coderline/alphatab)
+   用途：六线谱/五线谱渲染、播放光标同步跟播
+   许可：MPL 2.0（Mozilla Public License, Version 2.0）
+   说明：通过 npm 标准引入，不影响主程序 MIT 协议；其 Vite 插件
+        （@coderline/alphatab-vite）同为 MPL 2.0。
+
+2. sonivox.sf2 / sonivox.sf3（alphaTab 内置音源）
+   用途：谱面播放合成器音源（本地离线）
+   许可：Apache License 2.0
+   版权：Copyright (c) 2004-2006 Sonic Network Inc.
+   随 alphaTab 分发，许可文本见 public/soundfont/LICENSE。
+
+3. Bravura 字体
+   用途：乐谱符号渲染字体
+   许可：SIL Open Font License 1.1
+   版权：Copyright (c) 2015, Steinberg Media Technologies GmbH
+   许可文本见 public/font/Bravura-OFL.txt。
+
+4. React / ReactDOM
+   用途：前端界面框架
+   许可：MIT
+
+5. Tailwind CSS (@tailwindcss/vite)
+   用途：原子化样式系统（暗黑磨砂主题）
+   许可：MIT
+
+6. WaveSurfer.js
+   用途：音频波形可视化与音量推子
+   许可：BSD-3-Clause
+
+7. Framer Motion
+   用途：界面过渡动画
+   许可：MIT
+
+8. Lucide
+   用途：图标库
+   许可：ISC
+
+9. Zod
+   用途：InstrumentConfig 运行时校验
+   许可：MIT
+
+10. Vite / Vitest / TypeScript
+    用途：构建 / 测试 / 开发工具链
+    许可：MIT / MIT / Apache-2.0
+
+11. @spotify/basic-pitch（含随包分发的 TFJS 模型）
+    用途：音频 → MIDI 音符转写（Step 3 轻量极速档核心引擎，本地离线运行）
+    许可：Apache License 2.0
+    说明：模型（model/model.json + 权重分片，约 0.9MB）随 npm 包分发，
+          已随 public/model/ 提供，运行期零联网。
+
+12. @tensorflow/tfjs
+    用途：Basic Pitch 模型的浏览器推理后端（WebGL / WASM）
+    许可：Apache License 2.0
+
+规划中组件（Step 4 接入时补充完整声明）：
+- demucs.cpp / ONNX Runtime（高配/标准档分轨 sidecar，MIT）
