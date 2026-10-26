@@ -87,25 +87,74 @@ jobs:
             exit 1
           fi
 
-      # ---- 验证通过后才建 Draft Release（§8.5：action 与 CLI 均钉具体版本，防上游漂移） ----
-      - name: 构建 NSIS 安装器 + 签名更新包 + Draft Release
-        uses: tauri-apps/tauri-action@v1.0.0
+      # ---- 创建 Release + 上传资产 + latest.json（手动 gh，替代 tauri-action：
+      #      仓库根无 package.json，tauri-action 内部 tauri build 找不到构建方式；
+      #      手动构建（上方步骤）已产出全部产物，直接发布即可，不重复构建） ----
+      - name: 创建 Release + 上传安装包 + latest.json
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: v__VERSION__
-          releaseName: 'AI 智能扒谱 v__VERSION__'
-          releaseBody: |
-            下载下方 assets：
-            - **NSIS 安装器**（.exe，推荐）：双击安装，支持自动更新与 .agtp 文件关联
-            - **portable 绿色版**（.zip）：解压即用，无文件关联/无自动更新
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./app/package.json').version")
+          TAG="v$VERSION"
+          BUNDLE="src-tauri/target/release/bundle/nsis"
+          SETUP=$(ls "$BUNDLE"/*-setup.exe | head -1)
+          # ASCII 文件名上传（避开中文/空格的 Release 资产 URL 编码坑）
+          EXE_NAME="AI-Guitar-Transcriber_${VERSION}_x64-setup.exe"
+          cp "$SETUP" "$BUNDLE/$EXE_NAME"
+          cp "$SETUP.sig" "$BUNDLE/$EXE_NAME.sig"
 
-            许可声明：前端 npm 依赖见 `app/THIRD-PARTY-NOTICES.txt`；Rust 壳工程依赖见仓库 `src-tauri/THIRD-PARTY-NOTICES-RUST.txt`（随安装目录一并携带）。
-          releaseDraft: false
-          prerelease: true
-          includeUpdaterJson: true
+          # 生成 latest.json（updater 检查更新用；signature = .sig 文件内容）
+          node -e '
+            const fs = require("fs");
+            const [version, exe, repo, sigPath] = process.argv.slice(1);
+            const json = {
+              version,
+              notes: "AI 智能扒谱 更新。变更说明见 Release 页。",
+              pub_date: new Date().toISOString(),
+              platforms: {
+                "windows-x86_64": {
+                  signature: fs.readFileSync(sigPath, "utf8").trim(),
+                  url: `https://github.com/${repo}/releases/download/v${version}/${exe}`
+                }
+              }
+            };
+            fs.writeFileSync("src-tauri/target/release/bundle/nsis/latest.json", JSON.stringify(json, null, 2) + "\n");
+            console.log("latest.json:", JSON.stringify(json, null, 2));
+          ' "$VERSION" "$EXE_NAME" "$GITHUB_REPOSITORY" "$BUNDLE/$EXE_NAME.sig"
+
+          NOTES=$(cat <<'EOF'
+          下载下方 assets：
+          - **NSIS 安装器**（.exe，推荐）：双击安装，支持自动更新与 .agtp 文件关联
+          - **portable 绿色版**（.zip）：解压即用，无文件关联/无自动更新
+
+          许可声明：前端 npm 依赖见 `app/THIRD-PARTY-NOTICES.txt`；Rust 壳工程依赖见 `src-tauri/THIRD-PARTY-NOTICES-RUST.txt`（随安装目录携带）。
+          EOF
+          )
+          # 已存在则改用 upload（重跑幂等）
+          gh release create "$TAG" --prerelease --title "AI 智能扒谱 $TAG" --notes "$NOTES" \
+            "$BUNDLE/$EXE_NAME" "$BUNDLE/$EXE_NAME.sig" "$BUNDLE/latest.json" \
+            || gh release upload "$TAG" --clobber \
+                 "$BUNDLE/$EXE_NAME" "$BUNDLE/$EXE_NAME.sig" "$BUNDLE/latest.json"
+
+      # ---- latest.json 公开可达性冒烟（R6 更新链的更新器视角） ----
+      - name: latest.json 匿名可达性验证
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./app/package.json').version")
+          sleep 5
+          code=$(curl -s -o /tmp/latest-check.json -w '%{http_code}' \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json")
+          echo "HTTP $code"
+          cat /tmp/latest-check.json
+          [ "$code" = "200" ] || { echo "::error::latest.json 匿名访问返回 $code"; exit 1; }
+          node -e '
+            const j = JSON.parse(require("fs").readFileSync("/tmp/latest-check.json", "utf8"));
+            const v = require("./app/package.json").version;
+            if (j.version !== v) throw new Error("latest.json 版本 " + j.version + " != " + v);
+            if (!j.platforms["windows-x86_64"]?.signature) throw new Error("缺少签名");
+            console.log("latest.json 校验 OK：version=" + j.version);
+          '
 
       # ---- Draft Release 后体积断言复验（§11.2 R4 完成标准字面要求） ----
       - name: 体积断言复验（Draft Release 后）
