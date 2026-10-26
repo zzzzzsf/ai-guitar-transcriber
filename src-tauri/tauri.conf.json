@@ -53,7 +53,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkyQzU4RjQ4NzVFQUM1RjYKUldUMnhlcDFTSS9Ga21icERUWDFRRkdtckZ5aUplV1NCclF3YjRXT0RwbDFXVVlQWWlLSjM3SEQK",
       "endpoints": [
-        "https://github.com/dsh/ai-guitar-transcriber/releases/latest/download/latest.json"
+        "https://github.com/zzzzzsf/ai-guitar-transcriber/releases/latest/download/latest.json"
       ]
     }
   }
