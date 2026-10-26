@@ -103,8 +103,8 @@ jobs:
             - **portable 绿色版**（.zip）：解压即用，无文件关联/无自动更新
 
             许可声明：前端 npm 依赖见 `app/THIRD-PARTY-NOTICES.txt`；Rust 壳工程依赖见仓库 `src-tauri/THIRD-PARTY-NOTICES-RUST.txt`（随安装目录一并携带）。
-          releaseDraft: true
-          prerelease: false
+          releaseDraft: false
+          prerelease: true
           includeUpdaterJson: true
 
       # ---- Draft Release 后体积断言复验（§11.2 R4 完成标准字面要求） ----
