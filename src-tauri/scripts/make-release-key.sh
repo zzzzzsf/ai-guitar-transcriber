@@ -23,7 +23,7 @@ case "${dest_abs,,}" in
 esac
 
 KEY="$DEST/updater-release.key"
-ARGS=(generate -w "$KEY" --force)
+ARGS=(-w "$KEY" --force)
 if [ -n "${2:-}" ]; then ARGS+=(--password "$2"); fi
 npx --yes @tauri-apps/cli@2.12.4 signer generate "${ARGS[@]}"
 
