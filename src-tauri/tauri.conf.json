@@ -27,13 +27,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "createUpdaterArtifacts": true,
-    "icon": ["icons/icon.ico"],
-    "resources": ["THIRD-PARTY-NOTICES-RUST.txt"],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "THIRD-PARTY-NOTICES-RUST.txt"
+    ],
     "fileAssociations": [
       {
-        "ext": ["agtp"],
+        "ext": [
+          "agtp"
+        ],
         "name": "com.dsh.guitar.agtp",
         "description": "AI 智能扒谱工程文件",
         "role": "Editor"
@@ -42,7 +50,10 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"]
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
       },
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
@@ -51,7 +62,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkyQzU4RjQ4NzVFQUM1RjYKUldUMnhlcDFTSS9Ga21icERUWDFRRkdtckZ5aUplV1NCclF3YjRXT0RwbDFXVVlQWWlLSjM3SEQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ0MDAzMzhERURFNkFCMzUKUldRMXErYnRqVE1BMVB3SG1xUDVQQzFlK203aWhSVHkvOHg0ZFl5N2ZKdFpYVmtoeDZhNmswODgK",
       "endpoints": [
         "https://github.com/zzzzzsf/ai-guitar-transcriber/releases/latest/download/latest.json"
       ]
