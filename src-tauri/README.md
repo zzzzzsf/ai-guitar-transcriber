@@ -101,16 +101,16 @@ diff src-tauri/qa/dist-baseline.sha256 /tmp/dist-after.sha256 && echo "产物 ha
 
 | # | 待办 | 工具/状态 |
 | :-- | :--- | :--- |
-| R0 (P0) | 远端仓库建立与首次推送；owner/repo 定稿（喂给 R1 与 identifier 终审） | **部分完成**：根 `.gitignore` 已建（node_modules/dist/target/私钥全覆盖，已核），`git init` + 全量暂存核查通过（130 文件，公钥入库、私钥排除）。**剩余**：配置 git 身份 → 首笔 commit → GitHub 建仓推送 → owner/repo 定稿 |
-| R1 (P0) | updater endpoint 占位替换为真实 owner/repo + identifier 终审 | **CI 已有 fail-fast 拦截**（`scripts/release-gate.sh`，推 tag 必过）；替换后实测 `latest.json` 200。§8.3 备注：updater endpoints 支持多源降级，大陆镜像可作第二端点（minisign 保证不可投毒），是否首发启用视 R6 实测 |
-| R2 (P0) | minisign 正式钥（带密码、私钥移出仓库离线双备份） | **流程工具就绪**：`bash scripts/make-release-key.sh <仓库外目录>`；**CI 拦截开发钥**。纪律：库内开发钥永不签公开发布物 |
-| R3 (P1) | 真机矩阵人工跑 W1~W14（W15 已 CI 自动覆盖） | 需真机：无 WebView2 的 Win10 VM + Win11 物理机（150% DPI）+ 中文用户名 + 带空格路径；测量口径见上文 §10 注 |
-| R4 (P1) | 安装包体积 ≤25MB | ✅ **CI 已有断言**（Release 创建前置门禁 + Draft 后复验；本机实测 15.2MiB） |
-| R5 (P2) | msvc.cmd 环境包装边界 | ✅ 已完成保持现状；CLI 钉 2.12.4、tauri-action 钉 v1.0.0（本地/CI 对齐） |
-| R6 (P1) | 更新链端到端演练（M4"模拟更新演练"具体化） | R1/R2 完成后连发两个内测 tag（v0.1.0→v0.1.1，走 0.1.x 内测号段；对外首发定 1.0.0 或带 beta 标注——§8.5），实机验证 检查→下载→校验→安装→重启 全链路 + `latest.json` 200 |
-| R7 (P1) | Rust 侧第三方许可清单（合规） | cargo-about 生成 `THIRD-PARTY-NOTICES-RUST.txt`（不碰 app/），随安装器分发、Release 页携带 |
-| R8 (P1) | 根 README 反映桌面版 | ✅ 已补：文档链接 / 结构图 / 进度表桌面壳行 / SmartScreen 引导 |
-| R9 (P2) | v4.1 文档"外壳待决"表述过时 | **处理方式待用户拍板**：v4.1 加一行"已定 Tauri 2.12"，或声明冻结为历史快照 |
+| R0 (P0) | 远端仓库建立与首次推送；owner/repo 定稿 | ✅ **完成**：仓库 https://github.com/zzzzzsf/ai-guitar-transcriber（Public），owner/repo 已定稿；根 `.gitignore` 核查（私钥/产物不入库）；迁移基线 tag `app-baseline`（首笔 commit） |
+| R1 (P0) | updater endpoint 占位替换为真实 owner/repo + identifier 终审 | ✅ **完成**：endpoint = `github.com/zzzzzsf/ai-guitar-transcriber`；release-gate 三件套终审 CI 全过；`latest.json` 链实测 200（R6 中验证） |
+| R2 (P0) | minisign 正式钥 | ✅ **完成**：正式钥已生成于仓库外 `D:\Key\ai-guitar-transcriber\`（带密码），pubkey 已更新 + CI Secrets 已配；release-gate 拦截开发钥（库内开发钥永不签公开发布物）。**私钥离线双备份由密钥持有人自行保管** |
+| R3 (P1) | 真机矩阵人工跑 W1~W14（W15 已 CI 自动覆盖） | ⬜ **唯一剩余的发布前人工项**：无 WebView2 的 Win10 VM + Win11 物理机（150% DPI）+ 中文用户名 + 带空格路径；测量口径见上文 §10 注 |
+| R4 (P1) | 安装包体积 ≤25MB | ✅ CI 断言（前置门禁 + 复验）；实测 15.2MiB |
+| R5 (P2) | msvc.cmd 环境包装边界 | ✅ 完成；CLI 钉 2.12.4（tauri-action 已弃用，CI 手动 gh 发布） |
+| R6 (P1) | 更新链端到端演练 | 🔶 **自动化部分完成**：v0.1.0（prerelease）+ v0.1.1（正式版，latest 锚点）已发布，`releases/latest/download/latest.json` 实测 200 且指向 0.1.1、含有效 minisign 签名；CI 内置 tag 链 + latest 链双重可达性验证。**剩余**：实机演练（装 v0.1.0 → 应用内检查更新 → 升级 v0.1.1），可并入 R3 一起跑 |
+| R7 (P1) | Rust 侧第三方许可清单 | ✅ cargo-about 生成（514 crate），随安装器分发 |
+| R8 (P1) | 根 README 反映桌面版 | ✅ 完成 |
+| R9 (P2) | v4.1 文档"外壳待决"表述过时 | ✅ 完成：v4.1 顶部加状态注记（已定 Tauri 2.12 + 指向 Windows 方案），其余内容不动 |
 
 其他：
-- [ ] git 化后 W15① 切 `git diff` 双口径、`qa/*.sha256` 基线废弃（§11.1）
+- [x] git 化后 W15① 切 `git diff` 双口径：CI 以 `git diff app-baseline`（排除版本元数据——§8.5 发版行为）+ 哈希前后比对双保险；`qa/*.sha256` 保留为本机等价物
