@@ -52,7 +52,7 @@ pub fn daily_file_target() -> Target {
 }
 
 /// 本地时区当日日期（Windows GetLocalTime，无时区换算依赖）
-fn today_str() -> String {
+pub(crate) fn today_str() -> String {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
     let mut st = SYSTEMTIME {

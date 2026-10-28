@@ -66,10 +66,20 @@ jobs:
       - name: W15 验证（app 零改动 + 前端产物 hash 一致）——Release 创建前的门禁
         shell: bash
         run: |
+          # 口径①（git diff）：自迁移基线 tag 起，app/ 源码零改动。
+          # 排除 package.json：版本号三处同源是 §8.5 发版行为，由 check-versions.sh 把关。
+          git diff --stat app-baseline HEAD -- app/ ':(exclude)app/package.json' > /tmp/gitdiff.txt
+          if [ -s /tmp/gitdiff.txt ]; then
+            echo "::error::W15-1 失败：app/ 源码自 app-baseline 起被改动"
+            cat /tmp/gitdiff.txt
+            exit 1
+          fi
+          echo "W15-1a OK: git diff app-baseline（排除版本元数据）为空"
+
           find app -type f ! -path "app/node_modules/*" ! -path "app/dist/*" -print0 \
             | sort -z | xargs -0 sha256sum > /tmp/app-src-after.sha256
           diff /tmp/app-src-before.sha256 /tmp/app-src-after.sha256 \
-            && echo "W15-1 OK: app/ 零改动"
+            && echo "W15-1b OK: 构建过程 app/ 哈希前后一致"
           find app/dist -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/dist-after.sha256
           diff /tmp/dist-before.sha256 /tmp/dist-after.sha256 \
             && echo "W15-2 OK: 装进安装器的前端与直建产物 hash 一致"
@@ -147,26 +157,33 @@ jobs:
           REPO_URL="https://github.com/$GITHUB_REPOSITORY"
           check() {
             local label="$1" url="$2" code="" tries=0
-            # latest 指针有 CDN 传播延迟（实测数分钟），最多重试 8×15s。
-            # 注意：CI 的 bash 带 -e，`[ ... ] && break` 在条件不成立时会终止脚本，
-            # 必须写显式 if。
+            # 坑1：windows-latest 的 PATH 里 curl 是 Windows 原生 curl.exe，不认 MSYS 的
+            #      /tmp——-o 必须用相对路径。坑2：shell: bash 自带 set -e，
+            #      `code=$(curl ...)` 失败（含写文件失败）会直接终止脚本——赋值必须
+            #      放在 if 条件里保护。
             while [ $tries -lt 8 ]; do
-              code=$(curl -sL -o /tmp/latest-check.json -w '%{http_code}' "$url")
+              if code=$(curl -sL -o latest-check.tmp -w '%{http_code}' "$url"); then
+                :
+              else
+                code="000" # curl 自身失败（写文件/网络）
+              fi
               echo "[$label] 第 $((tries+1)) 次: HTTP $code"
               if [ "$code" = "200" ]; then break; fi
               tries=$((tries+1)); sleep 15
             done
             if [ "$code" != "200" ]; then
               echo "::error::[$label] 重试 8 次后仍 HTTP $code"
+              rm -f latest-check.tmp
               exit 1
             fi
             node -e '
-              const j = JSON.parse(require("fs").readFileSync("/tmp/latest-check.json", "utf8"));
+              const j = JSON.parse(require("fs").readFileSync("latest-check.tmp", "utf8"));
               const v = require("./app/package.json").version;
               if (j.version !== v) throw new Error("版本 " + j.version + " != " + v);
               if (!j.platforms["windows-x86_64"]?.signature) throw new Error("缺少签名");
               console.log("  内容校验 OK：version=" + j.version);
             '
+            rm -f latest-check.tmp
           }
           check "tag直链" "$REPO_URL/releases/download/v$VERSION/latest.json"
           check "latest链" "$REPO_URL/releases/latest/download/latest.json"

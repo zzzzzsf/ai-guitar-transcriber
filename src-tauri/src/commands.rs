@@ -303,18 +303,25 @@ fn update_taskbar_from_line(app: &AppHandle, line: &[u8]) {
     }
 }
 
-/// 从一行文本解析末尾的 "NN%"（demucs.cpp 等常见 CLI 进度样式）
+/// 从一行文本解析末尾的 "NN%" / "NN.N%"（demucs.cpp 等常见 CLI 进度样式）
 fn parse_percent(text: &str) -> Option<f64> {
     let idx = text.rfind('%')?;
-    let digits: String = text[..idx]
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let n: f64 = digits.parse().ok()?;
+    let mut digits = String::new();
+    let mut dot_seen = false;
+    for c in text[..idx].chars().rev() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if c == '.' && !dot_seen && !digits.is_empty() {
+            digits.push(c);
+            dot_seen = true;
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    let n: f64 = digits.chars().rev().collect::<String>().parse().ok()?;
     (0.0..=100.0).contains(&n).then_some(n)
 }
 
@@ -408,4 +415,71 @@ pub async fn download_model(
 #[tauri::command]
 pub fn diagnostics_export(app: AppHandle) -> Result<String, String> {
     crate::diagnostics::diagnostics_export_impl(&app)
+}
+
+// ============================================================
+// 纯函数单元测试（壳侧逻辑自验；cargo test 运行）
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_percent_integer() {
+        assert_eq!(parse_percent("50%"), Some(50.0));
+        assert_eq!(parse_percent("0%"), Some(0.0));
+        assert_eq!(parse_percent("100%"), Some(100.0));
+    }
+
+    #[test]
+    fn parse_percent_with_prefix_text() {
+        // demucs 类 CLI 常见输出：进度在行尾
+        assert_eq!(parse_percent("progress: 37%"), Some(37.0));
+        assert_eq!(parse_percent("\r separating vocals... 88%"), Some(88.0));
+    }
+
+    #[test]
+    fn parse_percent_decimal() {
+        assert_eq!(parse_percent("50.5%"), Some(50.5));
+        assert_eq!(parse_percent("7.25%"), Some(7.25));
+    }
+
+    #[test]
+    fn parse_percent_last_wins() {
+        // 多个百分号取最后一个（行尾才是当前进度）
+        assert_eq!(parse_percent("a% 30%"), Some(30.0));
+    }
+
+    #[test]
+    fn parse_percent_rejects_invalid() {
+        assert_eq!(parse_percent("abc"), None);
+        assert_eq!(parse_percent("%"), None);
+        assert_eq!(parse_percent(""), None);
+        assert_eq!(parse_percent("120%"), None); // 越界
+        // 语义边界：负号被截断，取紧邻数字段 "-5%" → 5.0（进度不为负，真实 CLI 不产出此输入）
+        assert_eq!(parse_percent("-5%"), Some(5.0));
+    }
+
+    #[test]
+    fn parse_percent_dot_only_is_none() {
+        // 点号后无整数段 → 解析失败
+        assert_eq!(parse_percent(".%"), None);
+    }
+
+    #[test]
+    fn today_str_format() {
+        // YYYY-MM-DD 格式（本地时区当日，喂给日志文件名与轮转）
+        let t = crate::logging::today_str();
+        assert_eq!(t.len(), 10);
+        let bytes = t.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            let expect_digit = matches!(i, 0..=3 | 5..=6 | 8..=9);
+            if expect_digit {
+                assert!(b.is_ascii_digit(), "位置 {i} 应为数字：{t}");
+            } else if i == 4 || i == 7 {
+                assert_eq!(*b, b'-', "位置 {i} 应为连字符：{t}");
+            }
+        }
+    }
 }
