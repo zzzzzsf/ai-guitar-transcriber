@@ -71,11 +71,11 @@ jobs:
         shell: bash
         run: |
           # 口径①（git diff）：自迁移基线 tag 起，app/ 源码零改动。
-          # 排除 package.json（版本号三处同源是 §8.5 发版行为，由 check-versions.sh 把关）——
-          # 用 grep 过滤而非 pathspec exclude（Git Bash 对 :(...) 有参数转换坑）。
-          # `|| true` 防 set -e：diff 有差异时退出码 1 属正常路径，交给下方 -s 判断。
-          git diff --stat app-baseline HEAD -- app/ > /tmp/gitdiff.txt || true
-          grep -v 'app/package\.json' /tmp/gitdiff.txt > /tmp/gitdiff-src.txt || true
+          # 用 --name-only（纯文件列表，无汇总行）；排除 package.json——版本号三处
+          # 同源是 §8.5 发版行为，由 check-versions.sh 把关。
+          # `|| true` 防 set -e：有差异时 diff 退出码 1 属正常路径，交给过滤后 -s 判断。
+          git diff --name-only app-baseline HEAD -- app/ > /tmp/gitdiff.txt || true
+          grep -v '^app/package\.json$' /tmp/gitdiff.txt > /tmp/gitdiff-src.txt || true
           if [ -s /tmp/gitdiff-src.txt ]; then
             echo "::error::W15-1 失败：app/ 源码自 app-baseline 起被改动"
             cat /tmp/gitdiff-src.txt
