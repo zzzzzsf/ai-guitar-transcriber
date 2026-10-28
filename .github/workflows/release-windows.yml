@@ -147,14 +147,19 @@ jobs:
           REPO_URL="https://github.com/$GITHUB_REPOSITORY"
           check() {
             local label="$1" url="$2" code="" tries=0
-            # latest 指针有 CDN 传播延迟（实测数分钟），最多重试 8×15s
+            # latest 指针有 CDN 传播延迟（实测数分钟），最多重试 8×15s。
+            # 注意：CI 的 bash 带 -e，`[ ... ] && break` 在条件不成立时会终止脚本，
+            # 必须写显式 if。
             while [ $tries -lt 8 ]; do
               code=$(curl -sL -o /tmp/latest-check.json -w '%{http_code}' "$url")
               echo "[$label] 第 $((tries+1)) 次: HTTP $code"
-              [ "$code" = "200" ] && break
+              if [ "$code" = "200" ]; then break; fi
               tries=$((tries+1)); sleep 15
             done
-            [ "$code" = "200" ] || { echo "::error::[$label] 重试后仍 HTTP $code"; exit 1; }
+            if [ "$code" != "200" ]; then
+              echo "::error::[$label] 重试 8 次后仍 HTTP $code"
+              exit 1
+            fi
             node -e '
               const j = JSON.parse(require("fs").readFileSync("/tmp/latest-check.json", "utf8"));
               const v = require("./app/package.json").version;
