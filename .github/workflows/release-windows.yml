@@ -145,12 +145,16 @@ jobs:
         run: |
           VERSION=$(node -p "require('./app/package.json').version")
           REPO_URL="https://github.com/$GITHUB_REPOSITORY"
-          sleep 5
           check() {
-            local label="$1" url="$2"
-            local code=$(curl -sL -o /tmp/latest-check.json -w '%{http_code}' "$url")
-            echo "[$label] HTTP $code <- $url"
-            [ "$code" = "200" ] || { echo "::error::[$label] 匿名访问返回 $code"; exit 1; }
+            local label="$1" url="$2" code="" tries=0
+            # latest 指针有 CDN 传播延迟（实测数分钟），最多重试 8×15s
+            while [ $tries -lt 8 ]; do
+              code=$(curl -sL -o /tmp/latest-check.json -w '%{http_code}' "$url")
+              echo "[$label] 第 $((tries+1)) 次: HTTP $code"
+              [ "$code" = "200" ] && break
+              tries=$((tries+1)); sleep 15
+            done
+            [ "$code" = "200" ] || { echo "::error::[$label] 重试后仍 HTTP $code"; exit 1; }
             node -e '
               const j = JSON.parse(require("fs").readFileSync("/tmp/latest-check.json", "utf8"));
               const v = require("./app/package.json").version;
@@ -188,7 +192,6 @@ jobs:
           Copy-Item $exe.FullName (Join-Path $stage 'AI 智能扒谱.exe')
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath 'portable-windows-x64.zip' -Force
           Remove-Item $stage -Recurse -Force
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag) { $tag = "v$(node -p "require('./app/package.json').version")" }
+          $tag = "v$(node -p "require('./app/package.json').version")"
           gh release upload $tag portable-windows-x64.zip --clobber
           Write-Host "portable: portable-windows-x64.zip (from $($exe.Name))"
