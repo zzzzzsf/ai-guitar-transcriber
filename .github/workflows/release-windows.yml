@@ -131,30 +131,36 @@ jobs:
           许可声明：前端 npm 依赖见 `app/THIRD-PARTY-NOTICES.txt`；Rust 壳工程依赖见 `src-tauri/THIRD-PARTY-NOTICES-RUST.txt`（随安装目录携带）。
           EOF
           )
-          # 已存在则改用 upload（重跑幂等）
-          gh release create "$TAG" --prerelease --title "AI 智能扒谱 $TAG" --notes "$NOTES" \
+          # 正式发布（latest/download/latest.json 只指向正式版——更新链的锚点）
+          gh release create "$TAG" --title "AI 智能扒谱 $TAG" --notes "$NOTES" \
             "$BUNDLE/$EXE_NAME" "$BUNDLE/$EXE_NAME.sig" "$BUNDLE/latest.json" \
             || gh release upload "$TAG" --clobber \
                  "$BUNDLE/$EXE_NAME" "$BUNDLE/$EXE_NAME.sig" "$BUNDLE/latest.json"
 
-      # ---- latest.json 公开可达性冒烟（R6 更新链的更新器视角） ----
+      # ---- latest.json 公开可达性冒烟（R6 更新链的更新器视角）。
+      #      GitHub 规则：releases/latest/ 只指向正式发布（prerelease/draft 不算 latest），
+      #      因此 tag 直链必验；latest 链在正式发布时必验。 ----
       - name: latest.json 匿名可达性验证
         shell: bash
         run: |
           VERSION=$(node -p "require('./app/package.json').version")
+          REPO_URL="https://github.com/$GITHUB_REPOSITORY"
           sleep 5
-          code=$(curl -s -o /tmp/latest-check.json -w '%{http_code}' \
-            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json")
-          echo "HTTP $code"
-          cat /tmp/latest-check.json
-          [ "$code" = "200" ] || { echo "::error::latest.json 匿名访问返回 $code"; exit 1; }
-          node -e '
-            const j = JSON.parse(require("fs").readFileSync("/tmp/latest-check.json", "utf8"));
-            const v = require("./app/package.json").version;
-            if (j.version !== v) throw new Error("latest.json 版本 " + j.version + " != " + v);
-            if (!j.platforms["windows-x86_64"]?.signature) throw new Error("缺少签名");
-            console.log("latest.json 校验 OK：version=" + j.version);
-          '
+          check() {
+            local label="$1" url="$2"
+            local code=$(curl -sL -o /tmp/latest-check.json -w '%{http_code}' "$url")
+            echo "[$label] HTTP $code <- $url"
+            [ "$code" = "200" ] || { echo "::error::[$label] 匿名访问返回 $code"; exit 1; }
+            node -e '
+              const j = JSON.parse(require("fs").readFileSync("/tmp/latest-check.json", "utf8"));
+              const v = require("./app/package.json").version;
+              if (j.version !== v) throw new Error("版本 " + j.version + " != " + v);
+              if (!j.platforms["windows-x86_64"]?.signature) throw new Error("缺少签名");
+              console.log("  内容校验 OK：version=" + j.version);
+            '
+          }
+          check "tag直链" "$REPO_URL/releases/download/v$VERSION/latest.json"
+          check "latest链" "$REPO_URL/releases/latest/download/latest.json"
 
       # ---- Draft Release 后体积断言复验（§11.2 R4 完成标准字面要求） ----
       - name: 体积断言复验（Draft Release 后）

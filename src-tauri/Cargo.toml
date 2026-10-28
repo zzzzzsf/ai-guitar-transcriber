@@ -1,6 +1,6 @@
 [package]
 name = "guitar"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI 智能扒谱 · Windows 原生外壳（Tauri 2）"
 authors = ["dsh"]
 license = "MIT"

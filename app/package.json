@@ -1,7 +1,7 @@
 {
   "name": "ai-guitar-transcriber",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "AI 智能扒谱 — 高颜值、本地离线优先的吉他转六线谱软件（首期 Guitar-First）",
   "license": "MIT",
