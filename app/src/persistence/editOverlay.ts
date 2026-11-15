@@ -74,13 +74,14 @@ export type OverlayApplyResult = {
 
 /**
  * 回放合并：基线音符按 noteId 建索引，逐条应用 overlay。
- * tuning 提供时，改 string/fret 会同步重算 pitch（弦音 + 品），
+ * tuning 提供时，改 string/fret 会同步重算 pitch（弦音 + Capo + 品），
  * 保证数据模型自洽（tuning 按低音弦在前的约定，与 GuitarProfile 一致）。
  */
 export function applyOverlay(
   base: FrettedNote[],
   entries: EditEntry[],
   tuning?: number[],
+  capo = 0,
 ): OverlayApplyResult {
   const byId = new Map<string, FrettedNote[]>();
   for (const n of base) {
@@ -120,7 +121,7 @@ export function applyOverlay(
       if (tuning && (('string' in changes) || ('fret' in changes))) {
         const stringIdx = tuning.length - next.string; // alphaTab 弦号 1=最高音弦
         const open = tuning[stringIdx];
-        if (open !== undefined) next.pitch = open + next.fret;
+        if (open !== undefined) next.pitch = open + capo + next.fret;
       }
       edited.set(t, next);
     }

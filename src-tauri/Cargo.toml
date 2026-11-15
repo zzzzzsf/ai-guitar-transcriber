@@ -1,6 +1,6 @@
 [package]
 name = "guitar"
-version = "0.1.1"
+version = "0.1.2"
 description = "AI 智能扒谱 · Windows 原生外壳（Tauri 2）"
 authors = ["dsh"]
 license = "MIT"
@@ -30,6 +30,7 @@ keyring = { version = "3", features = ["windows-native"] }
 sha2 = "0.10"
 hex = "0.4"
 zip = { version = "5", default-features = false, features = ["deflate"] }
+base64 = "0.22"
 os_info = "3"
 windows-sys = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",

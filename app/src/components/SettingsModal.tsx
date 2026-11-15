@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import packageInfo from '../../package.json';
 import { motion } from 'framer-motion';
 import {
   Bookmark,
@@ -679,8 +680,7 @@ function CopilotSection() {
       <div className="flex items-start gap-1.5 rounded-lg border border-amber-500/20 bg-amber-500/8 px-2.5 py-2 text-[10px] leading-relaxed text-amber-300/90">
         <ShieldAlert className="mt-0.5 h-3 w-3 shrink-0" />
         连接即表示你认可所选提供商的隐私政策：连接后使用 Copilot 功能时，谱面 alphaTex 文本会发送到所选提供商。
-        Key 仅保存在本次会话内存中，刷新后需重新连接，绝不写入 localStorage / sessionStorage
-        （装壳后将改存 OS keychain 并由主进程代理请求）。
+        Key 仅保存在本次会话内存中，刷新或重启后需重新连接，不写入浏览器存储。
       </div>
 
       <SectionTitle title="连接后可用的功能" />
@@ -723,8 +723,8 @@ function GeneralSection() {
 
       <SectionTitle title="数据与隐私" />
       <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 px-3.5 py-3 text-[11px] leading-relaxed text-emerald-300/90">
-        全部音频处理与转谱计算均在本地完成，不上传任何数据。界面偏好仅保存在本机
-        localStorage；后续 BYOK 大模型 API Key 将存入操作系统密钥链，绝不落 localStorage。
+        音频解码和转谱计算在本地完成。连接模型并使用 AI 标注、改谱或拆轨时，谱面和指令会发送至所选模型服务。
+        界面偏好保存在本机；API Key 仅保存在当前会话内存，刷新或重启后清除。
       </div>
 
       <SectionTitle title="重置" />
@@ -812,7 +812,7 @@ function AboutSection() {
         </div>
         <div>
           <div className="text-sm font-semibold text-zinc-100">AI 智能扒谱</div>
-          <div className="text-[11px] text-zinc-500">ai-guitar-transcriber · v0.1.0 · Guitar-First</div>
+          <div className="text-[11px] text-zinc-500">ai-guitar-transcriber · v{packageInfo.version} · Guitar-First</div>
         </div>
       </div>
       <div className="space-y-2 text-[11px] leading-relaxed text-zinc-400">

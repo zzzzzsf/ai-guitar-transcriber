@@ -9,8 +9,8 @@
  *   提供，运行期零联网，契合本地离线优先。
  * - onComplete 暴露 frames/onsets/contours 原始概率矩阵（§3.1 交叉验证的
  *   onset 概率可从这里取），首期直接使用 noteFramesToTime 的音符 onset 序列。
- * - pitchBends 语义（包内 generateFileData 源码）：第 i 个值是音符时长内
- *   均匀第 i 个采样点的音分偏移，time = start + i * duration / len。
+ * - pitchBends 是 contour bin 位移，每半音 3 bin；转换为 cents 后使用。
+ *   第 i 个采样点 time = start + i * duration / len。
  * - 长曲按 60~90s 分段喂入（§3.2：静音切点优先 + 固定切点 3s 重叠兜底，
  *   后处理一律在合并后的全局 note 流上跑），见下方分段常量与 transcribeAudio。
  */
@@ -142,26 +142,41 @@ export function planChunks(duration: number, cuts: CutPoint[]): ChunkRegion[] {
  */
 export function mergeChunkNotes(chunks: RawNote[][], plan: ChunkRegion[]): RawNote[] {
   const merged: RawNote[] = [];
+  // Only notes produced by earlier chunks are eligible for overlap pairing.
+  // A replacement pushed while processing chunk i must stay available for
+  // chunk i+1, but must never be re-consumed by a later note of chunk i.
+  const matchable = new Set<RawNote>();
   chunks.forEach((chunkNotes, i) => {
     const { start, overlapWithPrev } = plan[i];
+    const chunkOutputs: RawNote[] = [];
     for (const n of chunkNotes) {
-      const note = { ...n, onset: n.onset + start };
+      const note = {
+        ...n,
+        onset: n.onset + start,
+        pitchBend: n.pitchBend?.map((point) => ({ ...point, time: point.time + start })),
+      };
       const noteEnd = note.onset + Math.max(n.duration, 0.01);
       if (overlapWithPrev > 0 && n.onset < overlapWithPrev) {
         const idx = merged.findIndex((m) => {
+          if (!matchable.has(m)) return false;
           if (m.pitch !== note.pitch) return false;
           const mEnd = m.onset + Math.max(m.duration, 0.01);
           const overlaps = note.onset < mEnd && m.onset < noteEnd;
           return overlaps || Math.abs(m.onset - note.onset) <= MERGE_ONSET_TOLERANCE;
         });
         if (idx >= 0) {
+          const matched = merged[idx];
           merged.splice(idx, 1); // 消费配对项，保证一对一
+          matchable.delete(matched);
           merged.push(note);
+          chunkOutputs.push(note);
           continue;
         }
       }
       merged.push(note);
+      chunkOutputs.push(note);
     }
+    for (const m of chunkOutputs) matchable.add(m);
   });
   return merged.sort((a, b) => a.onset - b.onset || a.pitch - b.pitch);
 }
@@ -203,7 +218,7 @@ function basicPitchInstance(): BasicPitch {
 /**
  * NoteEventTime → RawNote（纯函数，单测覆盖）。
  * amplitude ∈ [0,1] → velocity 0-127（clamp 防越界）；
- * pitchBends 按包内语义展开为 {time, cents} 均匀序列。
+ * pitchBends 按包内每半音 3 bin 的语义转换为 {time, cents} 均匀序列。
  */
 export function noteEventsToRawNotes(events: NoteEventTime[]): RawNote[] {
   return events.map((e) => {
@@ -213,9 +228,9 @@ export function noteEventsToRawNotes(events: NoteEventTime[]): RawNote[] {
       duration: e.durationSeconds,
       pitch: e.pitchMidi,
       velocity: Math.max(1, Math.min(127, Math.round(e.amplitude * 127))),
-      pitchBend: bends.map((cents, i) => ({
+      pitchBend: bends.map((bins, i) => ({
         time: e.startTimeSeconds + (i * e.durationSeconds) / bends.length,
-        cents,
+        cents: (bins * 100) / 3,
       })),
     };
   });

@@ -22,6 +22,21 @@ describe('noteIdOf', () => {
 });
 
 describe('applyOverlay 回放合并', () => {
+  it('Capo 3 下改品位和改弦都使用实际发声音高，旧调用仍默认 Capo 0', () => {
+    const base = [note(0, 67, 1, 0)];
+    const fretOnly = { noteId: noteIdOf(base[0]), changes: { fret: 1 }, at: 1 };
+    expect(applyOverlay(base, [fretOnly], STANDARD_TUNING, 3).notes[0].pitch).toBe(68);
+    const moved = applyOverlay(base, [makeFretEdit(base[0], 2, 5)], STANDARD_TUNING, 3).notes[0];
+    expect(moved).toMatchObject({ string: 2, fret: 5, pitch: 67 });
+    expect(applyOverlay(base, [fretOnly], STANDARD_TUNING).notes[0].pitch).toBe(65);
+    expect(base[0]).toMatchObject({ pitch: 67, fret: 0 });
+  });
+
+  it('仅改时值/显式音高时不重复叠加 Capo', () => {
+    const base = [note(0, 67, 1, 0)];
+    const changes = { noteId: noteIdOf(base[0]), changes: { duration: 1, pitch: 70 }, at: 1 };
+    expect(applyOverlay(base, [changes], STANDARD_TUNING, 3).notes[0]).toMatchObject({ pitch: 70, duration: 1 });
+  });
   it('改弦品并按调弦重算 pitch', () => {
     // 52(E3) 原在 4 弦 3 品 → 改到 3 弦 7 品：G3(55) + 7 = 62(D4)
     const entry = makeFretEdit(BASE[2], 3, 7);

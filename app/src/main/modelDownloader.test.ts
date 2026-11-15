@@ -37,7 +37,9 @@ describe('downloadModel（双源 + SHA-256 + 断点续传）', () => {
     let sentRange: string | undefined;
     const fetchImpl = (async (_url: any, init: any) => {
       sentRange = init.headers?.Range;
-      return resp(206, FULL.slice(16), { 'content-length': String(16) });
+      return resp(206, FULL.slice(16), {
+        'content-length': String(16), 'content-range': 'bytes 16-31/32',
+      });
     }) as unknown as typeof fetch;
 
     const out = await downloadModel({
@@ -67,6 +69,51 @@ describe('downloadModel（双源 + SHA-256 + 断点续传）', () => {
     });
     expect(out.resumedBytes).toBe(0);
     expect(out.bytes).toBe(32);
+  });
+
+  it('一般网络失败的同源重试保留有效下载断点', async () => {
+    const fs = new MemoryFsAdapter({ 'models/v1/model.bin.part': bytes(16) });
+    const ranges: (string | null)[] = [];
+    const out = await downloadModel({
+      sources: [{ url: 'https://hf.example/model.bin' }],
+      destDir: 'models/v1', fileName: 'model.bin',
+      expectedSha256: await sha256Hex(FULL), fs,
+      fetchImpl: async (_url, init) => {
+        ranges.push(new Headers(init?.headers).get('Range'));
+        if (ranges.length === 1) throw new TypeError('network interrupted');
+        return resp(206, FULL.slice(16), { 'content-range': 'bytes 16-31/32' });
+      },
+    });
+    expect(ranges).toEqual(['bytes=16-', 'bytes=16-']);
+    expect(out.resumedBytes).toBe(16);
+  });
+
+  it.each([undefined, 'bytes 0-15/32', 'bytes 16-40/32', 'bytes 16-23/32'])(
+    '206 的错误范围 %s 不得拼接后当作完整模型', async (range) => {
+      const fs = new MemoryFsAdapter({ 'models/v1/model.bin.part': bytes(16) });
+      await expect(downloadModel({
+        sources: [{ url: 'https://hf.example/model.bin' }],
+        destDir: 'models/v1', fileName: 'model.bin', fs, fullRetriesPerSource: 0,
+        fetchImpl: async () => resp(206, FULL.slice(16), range ? { 'content-range': range } : {}),
+      })).rejects.toMatchObject({
+        failures: [{ reason: expect.stringContaining('Content-Range') }],
+      });
+      expect(await fs.exists('models/v1/model.bin')).toBe(false);
+      expect(await fs.exists('models/v1/model.bin.part')).toBe(false);
+    },
+  );
+
+  it('206 响应体未达到声明总长度时不得转正', async () => {
+    const fs = new MemoryFsAdapter({ 'models/v1/model.bin.part': bytes(16) });
+    await expect(downloadModel({
+      sources: [{ url: 'https://hf.example/model.bin' }],
+      destDir: 'models/v1', fileName: 'model.bin', fs, fullRetriesPerSource: 0,
+      fetchImpl: async () => resp(206, FULL.slice(16, 24), { 'content-range': 'bytes 16-31/32' }),
+    })).rejects.toMatchObject({
+      failures: [{ reason: expect.stringContaining('字节数不完整') }],
+    });
+    expect(await fs.exists('models/v1/model.bin')).toBe(false);
+    expect((await fs.readFile('models/v1/model.bin.part')).length).toBe(24);
   });
 
   it('SHA-256 不符 → 删 .part 从零重下一次，仍不符 → 换镜像源成功', async () => {
@@ -147,6 +194,43 @@ describe('downloadModel（双源 + SHA-256 + 断点续传）', () => {
     });
     expect(out.bytes).toBe(32);
     expect(await fs.exists('models/v1/model.bin')).toBe(true);
+  });
+
+  it('416 的错误断点不能绕过 hash 校验或覆盖已有模型', async () => {
+    const fs = new MemoryFsAdapter({
+      'models/v1/model.bin.part': bytes(8),
+      'models/v1/model.bin': FULL,
+    });
+    await expect(downloadModel({
+      sources: [{ url: 'https://hf.example/model.bin' }],
+      destDir: 'models/v1', fileName: 'model.bin',
+      expectedSha256: await sha256Hex(FULL),
+      fs, fullRetriesPerSource: 0,
+      fetchImpl: async () => new Response(null, { status: 416 }),
+    })).rejects.toMatchObject({
+      failures: [{ reason: expect.stringContaining('SHA-256 校验失败') }],
+    });
+    expect(await fs.readFile('models/v1/model.bin')).toEqual(FULL);
+    expect(await fs.exists('models/v1/model.bin.part')).toBe(false);
+  });
+
+  it('416 校验失败后从零重下，正确整包才转正', async () => {
+    const fs = new MemoryFsAdapter({ 'models/v1/model.bin.part': bytes(8) });
+    const ranges: unknown[] = [];
+    const out = await downloadModel({
+      sources: [{ url: 'https://hf.example/model.bin' }],
+      destDir: 'models/v1', fileName: 'model.bin',
+      expectedSha256: await sha256Hex(FULL), fs,
+      fetchImpl: async (_url, init) => {
+        ranges.push(new Headers(init?.headers).get('Range'));
+        return ranges.length === 1
+          ? new Response(null, { status: 416 })
+          : resp(200, FULL);
+      },
+    });
+    expect(ranges).toEqual(['bytes=8-', null]);
+    expect(out.sha256).toBe(await sha256Hex(FULL));
+    expect(await fs.readFile(out.path)).toEqual(FULL);
   });
 
   it('取消 → ModelDownloadError（下载已取消）', async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildTempoMap,
+  applyTempoCandidates,
   detectTempoCandidates,
   expandGradientToSteps,
   barStartTime,
@@ -95,6 +96,29 @@ describe('detectTempoCandidates（§3.5：BOCPD + CI 判据）', () => {
 });
 
 describe('buildTempoMap（变速点表 → 分段）', () => {
+  it('连续采纳候选保留已有变速与真实曲长，不使用演示曲时长', () => {
+    const base = buildTempoMap(100, [4, 4], 120, [{ time: 8, bpm: 90 }]);
+    const snapshot = structuredClone(base);
+    const first = applyTempoCandidates(base, [{
+      time: 20, beatIndex: 32, bpmBefore: 90, bpmAfter: 110, confidence: 0.9, gradient: false,
+    }]);
+    const second = applyTempoCandidates(first, [{
+      time: 50, beatIndex: 80, bpmBefore: 110, bpmAfter: 80, confidence: 0.9, gradient: false,
+    }]);
+    expect(second.map((s) => [s.start, s.bpm])).toEqual([[0, 120], [8, 90], [20, 110], [50, 80]]);
+    expect(second.at(-1)?.end).toBe(100);
+    expect(base).toEqual(snapshot);
+  });
+
+  it('在第一小节插入速度替换初始 BPM，并保留后续变速', () => {
+    const map = buildTempoMap(20, [4, 4], 80, [
+      { time: 0, bpm: 140 }, { time: 8, bpm: 100 },
+    ]);
+    expect(map.map(({ start, end, bpm }) => ({ start, end, bpm }))).toEqual([
+      { start: 0, end: 8, bpm: 140 }, { start: 8, end: 20, bpm: 100 },
+    ]);
+  });
+
   it('单点 80→60 分两段', () => {
     const map = buildTempoMap(28, [4, 4], 80, [{ time: 12, bpm: 60 }]);
     expect(map).toHaveLength(2);
@@ -119,6 +143,7 @@ describe('buildTempoMap（变速点表 → 分段）', () => {
       { time: 10, bpm: 140 },
     ]);
     expect(map).toHaveLength(2);
+    expect(map[0].bpm).toBe(90);
     expect(map[1].bpm).toBe(140);
   });
 });

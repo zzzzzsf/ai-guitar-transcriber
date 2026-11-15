@@ -30,6 +30,8 @@ describe('normalizeChordName', () => {
     expect(normalizeChordName('Hm')).toBeNull();
     expect(normalizeChordName('不是和弦')).toBeNull();
     expect(normalizeChordName('E' + '9'.repeat(30))).toBeNull();
+    expect(normalizeChordName('Cgarbage')).toBeNull();
+    expect(normalizeChordName('Cm7b5')).toBe('Cm7b5');
   });
 });
 
@@ -45,8 +47,8 @@ describe('validateAndNormalize（前置校验）', () => {
     ];
     const gate = validateAndNormalize(raw, 4);
     expect(gate.chords).toEqual([
-      { bar: 1, name: 'Em' },
-      { bar: 2, name: 'C' },
+      { bar: 0, name: 'Em' },
+      { bar: 1, name: 'C' },
     ]);
     expect(gate.kept).toBe(2);
     expect(gate.rejected).toBe(4);
@@ -71,9 +73,20 @@ describe('annotateChords 三条路径', () => {
     });
     expect(out.source).toBe('llm');
     expect(out.chords).toEqual([
-      { bar: 1, name: 'Em' },
-      { bar: 2, name: 'C/G' },
+      { bar: 0, name: 'Em' },
+      { bar: 1, name: 'C/G' },
     ]);
+  });
+
+  it('同一歌曲的本地与模型输出采用相同小节坐标', async () => {
+    const input = { notes: NOTES, beatGrid: GRID, alphaTex: ':8 0.6 | :8 2.5', barCount: 2 };
+    const local = await annotateChords(input);
+    const remote = await annotateChords({
+      ...input, llm: LLM,
+      chat: async () => ({ text: '{"chords":[{"bar":1,"name":"Em"},{"bar":2,"name":"C"}]}' }),
+    });
+    expect(remote.chords.map((c) => c.bar)).toEqual(local.chords.map((c) => c.bar));
+    expect(remote.chords.map((c) => c.bar + 1)).toEqual([1, 2]);
   });
 
   it('首轮垃圾输出 → 修复轮救回（chat 调用两次）', async () => {

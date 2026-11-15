@@ -5,8 +5,8 @@ import { LlmError } from './llmClient';
 const LLM = { providerId: 'kimi' as const, baseUrl: 'https://api.moonshot.cn/v1', model: 'kimi-k3', apiKey: 'sk-x' };
 /** 2 小节原谱（两轨拆分后小节数必须一致） */
 const TEX = '\\tempo 120 :8 0.6 | :8 2.5';
-const GOOD_LEAD = '\\tempo 120 :8 0.6 | :8 0.6';
-const GOOD_RHYTHM = '\\tempo 120 :8 2.5 | :8 2.5';
+const GOOD_LEAD = '\\tempo 120 :8 0.6 | r';
+const GOOD_RHYTHM = '\\tempo 120 r | :8 2.5';
 
 describe('splitGuitars（双吉他拆轨，无本地降级）', () => {
   it('成功拆分：两轨可解析、\\tempo 保留、小节数一致', async () => {
@@ -41,6 +41,17 @@ describe('splitGuitars（双吉他拆轨，无本地降级）', () => {
       name: 'LlmError',
       kind: 'parse',
     });
+  });
+
+  it('同一原音被复制到两轨 → 拒绝并进入修复轮；两轮仍失败则抛错', async () => {
+    let calls = 0;
+    const duplicated = { lead: GOOD_LEAD, rhythm: GOOD_LEAD };
+    const chat = async () => {
+      calls += 1;
+      return { text: JSON.stringify(duplicated) };
+    };
+    await expect(splitGuitars({ alphaTex: TEX, llm: LLM, chat })).rejects.toBeInstanceOf(LlmError);
+    expect(calls).toBe(2);
   });
 
   it('小节数不一致两轮 → 抛 LlmError（播放同步硬约束）', async () => {

@@ -38,6 +38,17 @@ jobs:
         working-directory: app
         run: npm ci
 
+      - name: 前端回归测试
+        working-directory: app
+        run: npm test
+
+      - name: Rust 回归测试
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: 发布基线检查回归测试
+        run: node --test src-tauri/scripts/check-w15-scope.test.mjs src-tauri/scripts/check-release-tag.test.mjs
+
       - name: 版本三处同源校验（app/package.json = tauri.conf.json = Cargo.toml）
         shell: bash
         run: bash src-tauri/scripts/check-versions.sh
@@ -47,6 +58,9 @@ jobs:
       - name: 首发三件套终审（endpoint 占位符 / identifier / 开发钥拦截）
         shell: bash
         run: bash src-tauri/scripts/release-gate.sh
+
+      - name: 发布元数据无 shell 等价检查（Git Bash 受限环境的兜底）
+        run: node src-tauri/scripts/check-release-metadata.mjs
 
       # ---- W15 基线（§10）：直建一次，记录 app 源码与 dist 产物哈希 ----
       - name: W15 基线（app 源码哈希 + 直接构建的 dist 哈希）
@@ -70,18 +84,9 @@ jobs:
       - name: W15 验证（app 零改动 + 前端产物 hash 一致）——Release 创建前的门禁
         shell: bash
         run: |
-          # 口径①（git diff）：自迁移基线 tag 起，app/ 源码零改动。
-          # 用 --name-only（纯文件列表，无汇总行）；排除 package.json——版本号三处
-          # 同源是 §8.5 发版行为，由 check-versions.sh 把关。
-          # `|| true` 防 set -e：有差异时 diff 退出码 1 属正常路径，交给过滤后 -s 判断。
-          git diff --name-only app-baseline HEAD -- app/ > /tmp/gitdiff.txt || true
-          grep -v '^app/package\.json$' /tmp/gitdiff.txt > /tmp/gitdiff-src.txt || true
-          if [ -s /tmp/gitdiff-src.txt ]; then
-            echo "::error::W15-1 失败：app/ 源码自 app-baseline 起被改动"
-            cat /tmp/gitdiff-src.txt
-            exit 1
-          fi
-          echo "W15-1a OK: git diff app-baseline（排除版本元数据）为空"
+          # 口径①（git diff）：历史版本元数据与本轮修复使用明确文件白名单。
+          # 白名单外任何 app/ 改动仍失败，不做整目录永久解冻。
+          node src-tauri/scripts/check-w15-scope.mjs app-baseline
 
           find app -type f ! -path "app/node_modules/*" ! -path "app/dist/*" -print0 \
             | sort -z | xargs -0 sha256sum > /tmp/app-src-after.sha256
@@ -104,59 +109,99 @@ jobs:
             exit 1
           fi
 
-      # ---- 创建 Release + 上传资产 + latest.json（手动 gh，替代 tauri-action：
-      #      仓库根无 package.json，tauri-action 内部 tauri build 找不到构建方式；
-      #      手动构建（上方步骤）已产出全部产物，直接发布即可，不重复构建） ----
-      - name: 创建 Release + 上传安装包 + latest.json
+      - name: 准备便携版及许可声明（公开前）
+        shell: pwsh
+        run: |
+          $exe = Get-Item -LiteralPath 'src-tauri/target/release/guitar.exe'
+          $stage = Join-Path (Get-Location).Path 'portable-stage'
+          if (Test-Path -LiteralPath $stage) { throw 'portable stage already exists' }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $stage 'AI 智能扒谱.exe')
+          Copy-Item -LiteralPath 'src-tauri/THIRD-PARTY-NOTICES-RUST.txt' -Destination $stage
+          Copy-Item -LiteralPath 'app/THIRD-PARTY-NOTICES.txt' -Destination $stage
+          $version = node -p "require('./app/package.json').version"
+          Copy-Item -LiteralPath "docs/releases/v$version.md" -Destination (Join-Path $stage 'README.md')
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath 'portable-windows-x64.zip'
+
+      - name: 创建草稿并上传完整资产（禁止覆盖既有版本）
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION=$(node -p "require('./app/package.json').version")
           TAG="v$VERSION"
+          test "$(git rev-parse "$TAG^{commit}")" = "$(git rev-parse HEAD)"
           BUNDLE="src-tauri/target/release/bundle/nsis"
-          SETUP=$(ls "$BUNDLE"/*-setup.exe | head -1)
-          # ASCII 文件名上传（避开中文/空格的 Release 资产 URL 编码坑）
           EXE_NAME="AI-Guitar-Transcriber_${VERSION}_x64-setup.exe"
-          cp "$SETUP" "$BUNDLE/$EXE_NAME"
-          cp "$SETUP.sig" "$BUNDLE/$EXE_NAME.sig"
-
-          # 生成 latest.json（updater 检查更新用；signature = .sig 文件内容）
+          mapfile -t SETUPS < <(find "$BUNDLE" -maxdepth 1 -type f -name '*-setup.exe')
+          test "${#SETUPS[@]}" -eq 1
+          SETUP="${SETUPS[0]}"
+          if [ "$SETUP" != "$BUNDLE/$EXE_NAME" ]; then
+            cp "$SETUP" "$BUNDLE/$EXE_NAME"
+            cp "$SETUP.sig" "$BUNDLE/$EXE_NAME.sig"
+          fi
+          cp portable-windows-x64.zip "$BUNDLE/portable-windows-x64.zip"
           node -e '
             const fs = require("fs");
-            const [version, exe, repo, sigPath] = process.argv.slice(1);
+            const [version, exe, repo, dir] = process.argv.slice(1);
+            const signature = fs.readFileSync(`${dir}/${exe}.sig`, "utf8").trim();
+            if (!signature) throw new Error("Missing updater signature");
             const json = {
               version,
-              notes: "AI 智能扒谱 更新。变更说明见 Release 页。",
+              notes: "变更说明见 Release 页。",
               pub_date: new Date().toISOString(),
-              platforms: {
-                "windows-x86_64": {
-                  signature: fs.readFileSync(sigPath, "utf8").trim(),
-                  url: `https://github.com/${repo}/releases/download/v${version}/${exe}`
-                }
-              }
+              platforms: { "windows-x86_64": {
+                signature,
+                url: `https://github.com/${repo}/releases/download/v${version}/${exe}`
+              }}
             };
-            fs.writeFileSync("src-tauri/target/release/bundle/nsis/latest.json", JSON.stringify(json, null, 2) + "\n");
-            console.log("latest.json:", JSON.stringify(json, null, 2));
-          ' "$VERSION" "$EXE_NAME" "$GITHUB_REPOSITORY" "$BUNDLE/$EXE_NAME.sig"
-
-          NOTES=$(cat <<'EOF'
-          下载下方 assets：
-          - **NSIS 安装器**（.exe，推荐）：双击安装，支持自动更新与 .agtp 文件关联
-          - **portable 绿色版**（.zip）：解压即用，无文件关联/无自动更新
-
-          许可声明：前端 npm 依赖见 `app/THIRD-PARTY-NOTICES.txt`；Rust 壳工程依赖见 `src-tauri/THIRD-PARTY-NOTICES-RUST.txt`（随安装目录携带）。
-          EOF
-          )
-          # 正式发布（latest/download/latest.json 只指向正式版——更新链的锚点）
-          gh release create "$TAG" --title "AI 智能扒谱 $TAG" --notes "$NOTES" \
+            fs.writeFileSync(`${dir}/latest.json`, JSON.stringify(json, null, 2) + "\n");
+            const crypto = require("crypto");
+            const names = [exe, `${exe}.sig`, "latest.json", "portable-windows-x64.zip"];
+            const hashes = names.map(name => {
+              const bytes = fs.readFileSync(`${dir}/${name}`);
+              if (!bytes.length) throw new Error(`Empty release asset: ${name}`);
+              return crypto.createHash("sha256").update(bytes).digest("hex") + "  " + name;
+            });
+            fs.writeFileSync(`${dir}/SHA256SUMS.txt`, hashes.join("\n") + "\n");
+          ' "$VERSION" "$EXE_NAME" "$GITHUB_REPOSITORY" "$BUNDLE"
+          gh release create "$TAG" --verify-tag --draft --title "AI 智能扒谱 $TAG" \
+            --notes-file "docs/releases/$TAG.md" \
             "$BUNDLE/$EXE_NAME" "$BUNDLE/$EXE_NAME.sig" "$BUNDLE/latest.json" \
-            || gh release upload "$TAG" --clobber \
-                 "$BUNDLE/$EXE_NAME" "$BUNDLE/$EXE_NAME.sig" "$BUNDLE/latest.json"
+            "$BUNDLE/portable-windows-x64.zip" "$BUNDLE/SHA256SUMS.txt"
 
-      # ---- latest.json 公开可达性冒烟（R6 更新链的更新器视角）。
-      #      GitHub 规则：releases/latest/ 只指向正式发布（prerelease/draft 不算 latest），
-      #      因此 tag 直链必验；latest 链在正式发布时必验。 ----
+      - name: 草稿资产与体积复验（公开前）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./app/package.json').version")
+          TAG="v$VERSION"
+          EXE_NAME="AI-Guitar-Transcriber_${VERSION}_x64-setup.exe"
+          gh release view "$TAG" --json isDraft,assets > release-draft-check.json
+          node -e '
+            const fs = require("fs");
+            const [exe, dir] = process.argv.slice(1);
+            const release = JSON.parse(fs.readFileSync("release-draft-check.json", "utf8"));
+            if (!release.isDraft) throw new Error("Release must remain draft until verified");
+            const names = [exe, `${exe}.sig`, "latest.json", "portable-windows-x64.zip", "SHA256SUMS.txt"];
+            if (release.assets.length !== names.length) throw new Error("Unexpected release assets");
+            for (const name of names) {
+              const asset = release.assets.find(a => a.name === name);
+              const size = fs.statSync(`${dir}/${name}`).size;
+              if (!asset || asset.size !== size || !size) throw new Error(`Asset mismatch: ${name}`);
+              if (name === exe && size > 26214400) throw new Error("Installer exceeds 25 MiB");
+            }
+          ' "$EXE_NAME" 'src-tauri/target/release/bundle/nsis'
+
+      - name: 公开已验收草稿
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./app/package.json').version")
+          gh release edit "v$VERSION" --draft=false --latest
+
       - name: latest.json 匿名可达性验证
         shell: bash
         run: |
@@ -164,63 +209,26 @@ jobs:
           REPO_URL="https://github.com/$GITHUB_REPOSITORY"
           check() {
             local label="$1" url="$2" code="" tries=0
-            # 坑1：windows-latest 的 PATH 里 curl 是 Windows 原生 curl.exe，不认 MSYS 的
-            #      /tmp——-o 必须用相对路径。坑2：shell: bash 自带 set -e，
-            #      `code=$(curl ...)` 失败（含写文件失败）会直接终止脚本——赋值必须
-            #      放在 if 条件里保护。
             while [ $tries -lt 8 ]; do
-              if code=$(curl -sL -o latest-check.tmp -w '%{http_code}' "$url"); then
+              if code=$(curl --connect-timeout 15 --max-time 45 -sL -o latest-check.tmp -w '%{http_code}' "$url"); then
                 :
               else
-                code="000" # curl 自身失败（写文件/网络）
+                code="000"
               fi
               echo "[$label] 第 $((tries+1)) 次: HTTP $code"
               if [ "$code" = "200" ]; then break; fi
               tries=$((tries+1)); sleep 15
             done
             if [ "$code" != "200" ]; then
-              echo "::error::[$label] 重试 8 次后仍 HTTP $code"
-              rm -f latest-check.tmp
+              echo "::error::[$label] 重试后仍 HTTP $code"
               exit 1
             fi
             node -e '
               const j = JSON.parse(require("fs").readFileSync("latest-check.tmp", "utf8"));
               const v = require("./app/package.json").version;
-              if (j.version !== v) throw new Error("版本 " + j.version + " != " + v);
-              if (!j.platforms["windows-x86_64"]?.signature) throw new Error("缺少签名");
-              console.log("  内容校验 OK：version=" + j.version);
+              if (j.version !== v) throw new Error("Updater version mismatch");
+              if (!j.platforms["windows-x86_64"]?.signature) throw new Error("Missing signature");
             '
-            rm -f latest-check.tmp
           }
           check "tag直链" "$REPO_URL/releases/download/v$VERSION/latest.json"
           check "latest链" "$REPO_URL/releases/latest/download/latest.json"
-
-      # ---- Draft Release 后体积断言复验（§11.2 R4 完成标准字面要求） ----
-      - name: 体积断言复验（Draft Release 后）
-        shell: bash
-        run: |
-          size=$(stat -c %s src-tauri/target/release/bundle/nsis/*-setup.exe)
-          if [ "$size" -gt 26214400 ]; then
-            echo "::error::Draft Release 附带的安装包超过 25MB 门禁，请删除本 Draft 重新排查" >&2
-            exit 1
-          fi
-          echo "体积复验 OK：$size 字节"
-
-      # ---- portable 绿色版（§8.1 次要分发：exe 以产品名入包） ----
-      - name: 打包 portable 绿色版并附到 Release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $exe = Get-ChildItem 'src-tauri/target/release' -Filter '*.exe' |
-            Where-Object { $_.Name -notmatch '_script_' } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $exe) { throw 'release exe not found' }
-          $stage = 'portable-stage'
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item $exe.FullName (Join-Path $stage 'AI 智能扒谱.exe')
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath 'portable-windows-x64.zip' -Force
-          Remove-Item $stage -Recurse -Force
-          $tag = "v$(node -p "require('./app/package.json').version")"
-          gh release upload $tag portable-windows-x64.zip --clobber
-          Write-Host "portable: portable-windows-x64.zip (from $($exe.Name))"

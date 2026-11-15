@@ -137,6 +137,7 @@ export const nodeSpawn: SpawnFn = async (opts) => {
 
 export type SeparationTier = 'balanced' | 'pro';
 
+/** 界面档位 → 分轨档位；null 表示轻量档不分轨 */
 export type RunSeparationOpts = {
   tier: SeparationTier;
   /** 输出目录（fsAdapter 相对路径，或 node 侧绝对路径 —— 传 fs 时为相对路径） */

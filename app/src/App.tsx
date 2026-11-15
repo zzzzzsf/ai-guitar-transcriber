@@ -10,6 +10,7 @@ import AiCopilotPanel from './components/AiCopilotPanel';
 import SettingsModal from './components/SettingsModal';
 import { SettingsProvider, useSettings, FINGERING_STYLE_LABEL } from './settings';
 import type { SettingsSection } from './settings';
+import type { PerformanceTier } from './types';
 import { CopilotProvider, useCopilot } from './copilot';
 import type { AiRewriteResult } from './llm/aiRewrite';
 import type { ChordAnnotationSource } from './llm/chordAnnotator';
@@ -28,7 +29,7 @@ import {
   barStartTime,
   detectTempo,
   detectTempoCandidates,
-  expandGradientToSteps,
+  applyTempoCandidates,
   quantizeNotes,
   TEMPO_AUTO_APPLY,
   TEMPO_CONFIRM,
@@ -36,13 +37,22 @@ import {
 import type { TempoCandidate } from './core/quantizer';
 import type { ChordLabel } from './core/chordDetector';
 import type { KeySelection } from './core/keyDetector';
-import { preprocessAudio } from './core/audioPreprocessor';
+import { preprocessAudio, decodeToAudioBuffer, audioBufferToSamples } from './core/audioPreprocessor';
 import { transcribeAudio, MAX_CHUNK_SECONDS } from './core/pitchTranscriber';
 import { annotateChords as annotateChordsEngine } from './llm/chordAnnotator';
 import { rewriteAlphaTex as rewriteAlphaTexEngine } from './llm/aiRewrite';
 import { splitGuitars as splitGuitarsEngine } from './llm/stemSplitter';
 import type { LlmConfig } from './llm/llmClient';
 import TempoMapPanel from './components/TempoMapPanel';
+import { MemoryFsAdapter, OpfsFsAdapter, type FsAdapter } from './io/fsAdapter';
+import { routeTier } from './main/tierRouter';
+import {
+  isDesktopRuntime,
+  runDesktopSeparation,
+  subscribeDesktopSeparation,
+} from './main/desktopSeparation';
+import type { SeparationTier } from './main/separatorRunner';
+import { countScoreBars, readGuitarScore } from './core/scoreContext';
 
 type AudioState = { url: string; name: string; size: number };
 /** 一次成功转谱的完整上下文：Copilot 功能（标注/改谱）都作用于它 */
@@ -57,22 +67,40 @@ function candidateKey(c: TempoCandidate): string {
   return `${c.time.toFixed(3)}|${c.bpmAfter}`;
 }
 
-/** 把候选（阶跃/渐变）展开为变速点并重排分段（§3.5 渐变 → 逐段线性插值） */
-function applyCandidates(base: BeatSection[], cands: TempoCandidate[]): BeatSection[] {
-  const steps: { time: number; bpm: number }[] = [];
-  for (const c of cands) {
-    if (c.gradient && c.endTime) {
-      steps.push(
-        ...expandGradientToSteps(
-          { start: c.time, end: c.endTime, from: c.bpmBefore, to: c.bpmAfter },
-          [4, 4],
-        ),
-      );
-    } else {
-      steps.push({ time: c.time, bpm: c.bpmAfter });
-    }
+function signalThrowIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  const error = new Error('转写已取消');
+  error.name = 'AbortError';
+  throw error;
+}
+
+/** 把浏览器解码后的 PCM 封装成 16-bit RIFF/WAVE，供 demucs 子进程直接读取。 */
+function encodePcm16Wav(samples: Float32Array, sampleRate: number): Uint8Array {
+  const dataBytes = samples.length * 2;
+  const out = new Uint8Array(44 + dataBytes);
+  const view = new DataView(out.buffer);
+  writeAscii(view, 0, 'RIFF');
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(view, 8, 'WAVE');
+  writeAscii(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, 'data');
+  view.setUint32(40, dataBytes, true);
+  for (let i = 0; i < samples.length; i++) {
+    const x = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
   }
-  return buildTempoMap(DEMO_DURATION, [4, 4], base[0]?.bpm ?? 80, steps);
+  return out;
+}
+
+function writeAscii(view: DataView, offset: number, text: string): void {
+  for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
 }
 
 function Workspace() {
@@ -91,6 +119,7 @@ function Workspace() {
   const [tempoSections, setTempoSections] = useState<BeatSection[] | null>(null);
   const [tempoCandidates, setTempoCandidates] = useState<TempoCandidate[]>([]);
   const [autoApplied, setAutoApplied] = useState<TempoCandidate | null>(null);
+  const tempoUndoRef = useRef<BeatSection[] | null>(null);
   const [ignoredRef] = useState(() => ({ current: new Set<string>() }));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('tier');
@@ -102,6 +131,17 @@ function Workspace() {
   const notesSourceRef = useRef<RawNote[] | null>(null);
   /** 最近一次前处理产物（BPM 重新检测用） */
   const samplesRef = useRef<{ samples: Float32Array; sampleRate: number } | null>(null);
+  const separationNoticeRef = useRef<string | null>(null);
+  const sourceSettingsRef = useRef<{
+    tier: PerformanceTier;
+    bandpass: boolean;
+    startedAt: number;
+    sourceRevision: number;
+  } | null>(null);
+  const activeFileRef = useRef<File | null>(null);
+  const activeAbortRef = useRef<AbortController | null>(null);
+  const rerunTierRef = useRef(false);
+  const runRevisionRef = useRef(0);
   // ---- Copilot（BYOK）----
   /** 和弦标注来源/降级说明（逐小节结果在 chords） */
   const [chordMeta, setChordMeta] = useState<{ source: ChordAnnotationSource; notice?: string } | null>(null);
@@ -110,11 +150,16 @@ function Workspace() {
   /** 双吉他拆轨预览（Lead/Rhythm 待选用） */
   const [splitPreview, setSplitPreview] = useState<SplitResult | null>(null);
   /** AI 改谱回滚栈（§2.2 snapshot 的会话内轻量版） */
-  const aiHistoryRef = useRef<{ tex: string; label: string }[]>([]);
+  const aiHistoryRef = useRef<{
+    tex: string; label: string; lastRun: LastRun; sourceNotes: RawNote[] | null;
+  }[]>([]);
+  const copilotVersionRef = useRef(0);
   const [aiCanUndo, setAiCanUndo] = useState(false);
   // ---- §3.4 原曲对照（原曲 + MIDI 合成同时发声）----
   const [backingOn, setBackingOn] = useState(false);
   const backingAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [backingVolume, setBackingVolume] = useState(0.5);
+  const [speed, setSpeed] = useState(1);
   const [status, setStatus] = useState(
     '就绪 · Step 1 界面与渲染 ✓ · Step 2 GuitarProfile 核心 ✓ · Step 3 Basic Pitch 轻量档 ✓ · Step 4 AI Copilot（BYOK）已接入 —— 拖入吉他音频即可转谱',
   );
@@ -125,11 +170,28 @@ function Workspace() {
   }, []);
   const onApiReady = useCallback((api: AlphaTabApi | null) => setTabApi(api), []);
 
+  function resetCopilotContext() {
+    copilotVersionRef.current += 1;
+    aiHistoryRef.current = [];
+    setAiCanUndo(false);
+    setCopilotBusy(false);
+    setChords(null);
+    setChordMeta(null);
+    setRewritePreview(null);
+    setSplitPreview(null);
+  }
+
   /** 统一转写入口：分段 → 网格 → 量化 → 五步流水线（变速改动后全链路重算） */
-  async function runTranscription(source: RawNote[], sections: BeatSection[], tempoNote?: string) {
+  async function runTranscription(source: RawNote[], sections: BeatSection[], tempoNote?: string): Promise<boolean> {
+    const revision = runRevisionRef.current;
+    resetCopilotContext();
     setBusy(true);
     await new Promise((r) => setTimeout(r, 30));
+    if (revision !== runRevisionRef.current) return false;
     try {
+      if (isRealAudio && separationNoticeRef.current) {
+        tempoNote = `${tempoNote ? `${tempoNote} · ` : ''}${separationNoticeRef.current}`;
+      }
       const profile = await ProfileRegistry.get('guitar');
       const beatGrid = buildBeatGridFromSections(sections);
       const styleName = FINGERING_STYLE_LABEL[settings.fingeringStyle].label;
@@ -149,14 +211,27 @@ function Workspace() {
       setStatus(
         `转写完成：${result.notes.length} 个音符 → alphaTex ${result.alphaTex.length} 字符 · 调性 ${key ? `${key.name}（置信度 ${key.confidence.toFixed(2)}）` : '未识别'} · 指法风格 ${styleName} · ${tempoNote ? `${tempoNote} · ` : ''}Capo 推荐：${top?.reason ?? '—'}${harmonics ? ` · 疑似泛音 ${harmonics} 已标记（不入谱，编辑器可处置）` : ''}`,
       );
+      return true;
     } catch (e) {
       setStatus(`转写失败：${String(e)}`);
+      return false;
     } finally {
       setBusy(false);
     }
   }
 
   async function runDemo() {
+    activeAbortRef.current?.abort();
+    runRevisionRef.current += 1;
+    activeFileRef.current = null;
+    sourceSettingsRef.current = null;
+    samplesRef.current = null;
+    setAudio((current) => {
+      if (current) URL.revokeObjectURL(current.url);
+      return null;
+    });
+    setBackingOn(false);
+    resetCopilotContext();
     setBusy(true);
     setStatus('正在运行 GuitarProfile 五步流水线：过滤 → 聚拢 → Auto-Capo → Viterbi → 技巧检测 → alphaTex…');
     // 让 UI 先渲染出运行状态
@@ -167,6 +242,7 @@ function Workspace() {
     notesSourceRef.current = demoNotes;
     setIsRealAudio(false);
     setAudioDurationSec(0);
+    separationNoticeRef.current = null;
     const all = detectTempoCandidates(createDemoBeatTimes());
     const visible = all.filter((c) => c.confidence >= TEMPO_CONFIRM);
     const auto = visible.filter((c) => c.confidence >= TEMPO_AUTO_APPLY);
@@ -175,11 +251,13 @@ function Workspace() {
     let tempoNote: string | undefined;
     if (auto.length > 0) {
       // 高置信度 → 自动应用不打扰（渐进 UX）
-      sections = applyCandidates(sections, auto);
+      tempoUndoRef.current = structuredClone(sections);
+      sections = applyTempoCandidates(sections, auto);
       const c = auto[auto.length - 1];
       tempoNote = `检测到变速 ${Math.round(c.bpmBefore)} → ${Math.round(c.bpmAfter)} BPM（置信度 ${c.confidence}）已自动应用`;
       setAutoApplied(c);
     } else {
+      tempoUndoRef.current = null;
       setAutoApplied(null);
     }
     setTempoSections(sections);
@@ -190,7 +268,8 @@ function Workspace() {
   /** 候选采纳（确认流） */
   async function acceptTempo(c: TempoCandidate) {
     if (!tempoSections) return;
-    const sections = applyCandidates(tempoSections, [c]);
+    tempoUndoRef.current = structuredClone(tempoSections);
+    const sections = applyTempoCandidates(tempoSections, [c]);
     setTempoSections(sections);
     setTempoCandidates((list) => list.filter((x) => candidateKey(x) !== candidateKey(c)));
     setAutoApplied(c);
@@ -208,10 +287,11 @@ function Workspace() {
     setTempoCandidates((list) => list.filter((x) => candidateKey(x) !== candidateKey(c)));
   }
 
-  /** 撤销自动应用：恢复恒定 BPM */
+  /** 撤销最近一次变速候选：恢复该次应用前的完整分段。 */
   async function undoAutoTempo() {
-    if (!notesSourceRef.current) return;
-    const sections = baseDemoSections();
+    if (!notesSourceRef.current || !tempoUndoRef.current) return;
+    const sections = tempoUndoRef.current;
+    tempoUndoRef.current = null;
     setTempoSections(sections);
     setAutoApplied(null);
     await runTranscription(notesSourceRef.current, sections);
@@ -225,6 +305,8 @@ function Workspace() {
     steps.push({ time, bpm });
     const duration = isRealAudio ? audioDurationSec : DEMO_DURATION;
     const sections = buildTempoMap(duration, [4, 4], tempoSections[0]?.bpm ?? 80, steps);
+    tempoUndoRef.current = null;
+    setAutoApplied(null);
     setTempoSections(sections);
     await runTranscription(
       notesSourceRef.current,
@@ -236,14 +318,22 @@ function Workspace() {
   /** 重置 BPM：demo 回恒定分段；真实音频对缓存的前处理产物重新检测 */
   async function resetTempo() {
     if (!notesSourceRef.current) return;
-    if (isRealAudio && samplesRef.current) {
-      await runRealPipeline(samplesRef.current, performance.now(), 'BPM 重新检测');
-      return;
+    setBusy(true);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    try {
+      const sections = isRealAudio && samplesRef.current
+        ? detectTempo(samplesRef.current.samples, samplesRef.current.sampleRate)
+        : baseDemoSections();
+      tempoUndoRef.current = null;
+      setTempoSections(sections);
+      setAutoApplied(null);
+      setTempoCandidates([]);
+      await runTranscription(notesSourceRef.current, sections, '已重新检测 BPM 并重排缓存音符');
+    } catch (error) {
+      setStatus(`BPM 重新检测失败：${String(error)}`);
+    } finally {
+      setBusy(false);
     }
-    const sections = baseDemoSections();
-    setTempoSections(sections);
-    setAutoApplied(null);
-    await runTranscription(notesSourceRef.current, sections);
   }
 
   /** 当前 BYOK 连接 → 引擎 LlmConfig（Key 从会话内存取；本地 Ollama 可无 Key） */
@@ -257,29 +347,68 @@ function Workspace() {
     };
   }
 
-  /** 谱面小节数（与 texGuard.splitBars 同口径：'|' 分段计数） */
+  /** 声部共享小节时间轴，不能把各声部的竖线重复计数。 */
   function barCountOf(t: string): number {
-    return t.split('|').filter((s) => s.trim()).length;
+    return countScoreBars(t);
   }
 
   /** AI 操作落谱（统一推入回滚栈） */
-  function applyAiTex(nextTex: string, label: string) {
-    aiHistoryRef.current.push({ tex, label });
+  function applyAiTex(nextTex: string, label: string, generatedRun?: LastRun): boolean {
+    if (!lastRun) return false;
+    let nextRun: LastRun;
+    try {
+      const base = generatedRun ?? lastRun;
+      const parsed = readGuitarScore(nextTex);
+      const velocities = new Map(base.result.notes.map((n) => [
+        `${n.onset.toFixed(6)}|${n.pitch}`, n.velocity ?? 100,
+      ]));
+      const notes = parsed.notes.map((n) => ({
+        ...n, velocity: velocities.get(`${n.onset.toFixed(6)}|${n.pitch}`) ?? 100,
+      }));
+      nextRun = {
+        ...base,
+        rawNotes: notes.map((n) => ({
+          onset: n.onset, duration: n.duration, pitch: n.pitch, velocity: n.velocity,
+          pitchBend: n.bend ?? [], tuplet: n.tuplet,
+        })),
+        result: {
+          alphaTex: nextTex, notes,
+          meta: { ...base.result.meta, tuning: parsed.tuning, capo: parsed.capo },
+        },
+      };
+    } catch (error) {
+      setStatus(`无法应用改谱：${String(error)}`);
+      return false;
+    }
+    copilotVersionRef.current += 1;
+    setCopilotBusy(false);
+    aiHistoryRef.current.push({
+      tex, label, lastRun: structuredClone(lastRun),
+      sourceNotes: structuredClone(notesSourceRef.current),
+    });
     if (aiHistoryRef.current.length > 20) aiHistoryRef.current.shift();
     setAiCanUndo(true);
     setTex(nextTex);
+    setLastRun(nextRun);
+    notesSourceRef.current = nextRun.rawNotes;
     setChords(null);
     setChordMeta(null);
     setRewritePreview(null);
     setSplitPreview(null);
+    return true;
   }
 
   /** 撤销最近一次 AI 改谱/拆轨落谱 */
   function undoAiEdit() {
     const prev = aiHistoryRef.current.pop();
     if (!prev) return;
+    copilotVersionRef.current += 1;
+    setCopilotBusy(false);
     setAiCanUndo(aiHistoryRef.current.length > 0);
     setTex(prev.tex);
+    setLastRun(prev.lastRun);
+    notesSourceRef.current = prev.sourceNotes;
+    setTempoSections(prev.lastRun.beatGrid.sections);
     setChords(null);
     setChordMeta(null);
     setRewritePreview(null);
@@ -289,11 +418,13 @@ function Workspace() {
 
   /** Copilot：自动标注和弦 —— 已连接走 LLM（失败自动降级本地），未连接走本地规则（§1.3） */
   async function annotateChords() {
-    if (!lastRun) return;
+    if (!lastRun || busy || copilotBusy) return;
+    const version = ++copilotVersionRef.current;
     setCopilotBusy(true);
     setChordMeta(null);
     await new Promise((r) => setTimeout(r, 30));
     try {
+      if (version !== copilotVersionRef.current) return;
       const out = await annotateChordsEngine({
         notes: lastRun.result.notes,
         beatGrid: lastRun.beatGrid,
@@ -302,6 +433,7 @@ function Workspace() {
         key: lastRun.result.meta.key?.name,
         llm: llmConfig(),
       });
+      if (version !== copilotVersionRef.current) return;
       setChords(out.chords);
       setChordMeta({ source: out.source, notice: out.notice });
       const srcLabel =
@@ -310,51 +442,54 @@ function Workspace() {
         `和弦标注完成（${srcLabel}）：${out.chords.map((l) => l.name).join(' | ')}${out.notice ? ` · ${out.notice}` : ''}`,
       );
     } catch (e) {
-      setStatus(`和弦标注失败：${String(e)}`);
+      if (version === copilotVersionRef.current) setStatus(`和弦标注失败：${String(e)}`);
     } finally {
-      setCopilotBusy(false);
+      if (version === copilotVersionRef.current) setCopilotBusy(false);
     }
   }
 
   /** Copilot：新手简化改谱 —— 用省力档权重重新寻路（本地规则，瞬时离线） */
   function simplifyForBeginner() {
-    if (!lastRun) return;
+    if (!lastRun || busy || copilotBusy) return;
+    const version = ++copilotVersionRef.current;
     setCopilotBusy(true);
     setStatus('正在按省力档（新手）权重重新寻路…');
     setTimeout(async () => {
       try {
         const profile = await ProfileRegistry.get('guitar');
+        if (version !== copilotVersionRef.current) return;
         const result = profile.transcribe(lastRun.rawNotes, {
           beatGrid: lastRun.beatGrid,
           style: 'easy',
           keyOverride,
         });
-        applyAiTex(result.alphaTex, '新手简化（省力档重排）');
-        setLastRun({ ...lastRun, result });
+        if (!applyAiTex(result.alphaTex, '新手简化（省力档重排）', { ...lastRun, result })) return;
         setStatus(
           `新手简化改谱完成：${result.notes.length} 个音符已按省力档重排指法（空弦偏好 ↑ · 跨度放宽 · 低把位偏好 ↑）· 可撤销`,
         );
       } catch (e) {
-        setStatus(`简化改谱失败：${String(e)}`);
+        if (version === copilotVersionRef.current) setStatus(`简化改谱失败：${String(e)}`);
       } finally {
-        setCopilotBusy(false);
+        if (version === copilotVersionRef.current) setCopilotBusy(false);
       }
     }, 50);
   }
 
   /** Copilot：AI 改谱（LLM 两轮 + 前置校验；产出进预览，采纳才落谱） */
   async function runRewrite(instruction: string) {
-    if (!lastRun || !instruction.trim()) return;
+    if (!lastRun || !instruction.trim() || busy || copilotBusy) return;
+    const version = ++copilotVersionRef.current;
     setCopilotBusy(true);
     setRewritePreview(null);
     const connectedLabel = connection ? `${connection.label} · ${connection.model}` : '';
     setStatus(
       connection
         ? `AI 改谱中（${connectedLabel}）：${instruction.trim()}…`
-        : '未连接大模型 —— 按本地规则执行降把位重排…',
+        : '未连接大模型 —— 正在检查本地规则是否支持此要求…',
     );
     await new Promise((r) => setTimeout(r, 30));
     try {
+      if (version !== copilotVersionRef.current) return;
       const meta = lastRun.result.meta;
       const out = await rewriteAlphaTexEngine({
         alphaTex: tex,
@@ -362,69 +497,228 @@ function Workspace() {
         notes: lastRun.result.notes,
         tuning: meta.tuning,
         capo: meta.capo,
+        retex: async (notes) => {
+          const [{ toAlphaTex }, { resolveWeights }] = await Promise.all([
+            import('./profiles/GuitarProfile'), import('./profiles/costWeights'),
+          ]);
+          return toAlphaTex(notes, {
+            config: { tuning: meta.tuning, capo: meta.capo },
+            tuning: { tuning: meta.tuning, capo: meta.capo, suggestions: [], autoDetected: false },
+            beatGrid: lastRun.beatGrid,
+            key: meta.key,
+            keyOverride,
+            style: settings.fingeringStyle,
+            weights: resolveWeights(settings.fingeringStyle),
+          });
+        },
         llm: llmConfig(),
       });
+      if (version !== copilotVersionRef.current) return;
+      if (out.alphaTex === tex) {
+        setRewritePreview(null);
+        setStatus(`谱面未修改：${out.notice ?? '本次请求没有产生可采纳的改动'}`);
+        return;
+      }
       setRewritePreview(out);
       const src =
         out.source === 'llm' ? '已通过前置校验，请预览确认' : `本地降级：${out.notice ?? ''}`;
       setStatus(`AI 改谱完成（${out.source === 'llm' ? '大模型' : '本地降级'}）· ${src}`);
     } catch (e) {
-      setStatus(`AI 改谱失败：${String(e)}`);
+      if (version === copilotVersionRef.current) setStatus(`AI 改谱失败：${String(e)}`);
     } finally {
-      setCopilotBusy(false);
+      if (version === copilotVersionRef.current) setCopilotBusy(false);
     }
   }
 
   /** 采纳 AI 改谱预览 → 落谱 */
   function acceptRewrite() {
     if (!rewritePreview) return;
-    applyAiTex(rewritePreview.alphaTex, 'AI 改谱');
+    if (!applyAiTex(rewritePreview.alphaTex, 'AI 改谱')) return;
     setStatus('AI 改谱已落谱 · 可撤销');
   }
 
   /** Copilot：双吉他拆轨（LLM 专属，无本地降级 → 未连接禁用） */
   async function runSplit() {
-    if (!lastRun || !connection) return;
+    if (!lastRun || !connection || busy || copilotBusy) return;
+    const version = ++copilotVersionRef.current;
     setCopilotBusy(true);
     setSplitPreview(null);
     setStatus(`双吉他拆轨中（${connection.label} · ${connection.model}）…`);
     await new Promise((r) => setTimeout(r, 30));
     try {
+      if (version !== copilotVersionRef.current) return;
       const out = await splitGuitarsEngine({ alphaTex: tex, llm: llmConfig() });
+      if (version !== copilotVersionRef.current) return;
       setSplitPreview(out);
       setStatus('拆轨完成 · 两轨均通过前置校验，请预览并选择要应用的轨');
     } catch (e) {
-      setStatus(`双吉他拆轨失败：${String(e)}`);
+      if (version === copilotVersionRef.current) setStatus(`双吉他拆轨失败：${String(e)}`);
     } finally {
-      setCopilotBusy(false);
+      if (version === copilotVersionRef.current) setCopilotBusy(false);
     }
   }
 
   function onFile(file: File) {
     if (busy) return;
     if (audio) URL.revokeObjectURL(audio.url);
+    setTex(DEMO_ALPHA_TEX);
+    setLastRun(null);
+    setTempoSections(null);
+    setTempoCandidates([]);
+    setAutoApplied(null);
     setAudio({ url: URL.createObjectURL(file), name: file.name, size: file.size });
     void transcribeFile(file);
   }
 
   /** §6 Step 3 轻量档闭环：文件 → 前处理 → BPM 检测 → Basic Pitch → GuitarProfile → 谱面 */
-  async function transcribeFile(file: File) {
+  async function transcribeFile(file: File): Promise<boolean> {
+    resetCopilotContext();
     const startedAt = performance.now();
+    activeFileRef.current = file;
+    const task = new AbortController();
+    activeAbortRef.current?.abort();
+    activeAbortRef.current = task;
+    const revision = ++runRevisionRef.current;
     setBusy(true);
     try {
-      const withBandpass = settings.tier === 'light' && settings.bandpass;
+      const tier = settings.tier;
+      const originalBytes = new Uint8Array(await file.arrayBuffer());
+      separationNoticeRef.current = null;
+      const withBandpass = tier === 'light' && settings.bandpass;
       setStatus(
-        `正在解码「${file.name}」并前处理（mono${withBandpass ? ' + 轻量档带通 70Hz~8kHz' : ''}）…`,
+        tier === 'light'
+          ? `正在解码「${file.name}」并前处理（mono${withBandpass ? ' + 轻量档带通 70Hz~8kHz' : ''}）…`
+          : `正在准备「${file.name}」的分轨（${tier === 'balanced' ? '均衡档' : '高配档'}）…`,
       );
-      await new Promise((r) => setTimeout(r, 30));
-      const pre = await preprocessAudio(await file.arrayBuffer(), { bandpass: withBandpass });
-      setAudioDurationSec(pre.samples.length / pre.sampleRate);
-      await runRealPipeline(pre, startedAt);
+      const source =
+        tier === 'light'
+          ? await preprocessAudio(originalBytes.buffer as ArrayBuffer, { bandpass: withBandpass })
+          : await prepareTierSource(originalBytes, tier, task.signal);
+      signalThrowIfAborted(task.signal);
+      setAudioDurationSec(source.samples.length / source.sampleRate);
+      const pipelineOk = await runRealPipeline(source, startedAt);
+      if (!pipelineOk) return false;
+      signalThrowIfAborted(task.signal);
+      if (revision !== runRevisionRef.current) return false;
+      sourceSettingsRef.current = {
+        tier,
+        bandpass: settings.bandpass,
+        startedAt,
+        sourceRevision: revision,
+      };
     } catch (e) {
-      setStatus(`转谱失败：${String(e)}`);
+      const cancelled = task.signal.aborted ||
+        ((e as { name?: string }).name === 'SeparatorError' &&
+          (e as { kind?: string }).kind === 'aborted');
+      if (cancelled) setStatus('转写已取消');
+      else setStatus(`转谱失败：${String(e)}`);
+      return false;
     } finally {
+      if (activeAbortRef.current === task) activeAbortRef.current = null;
+      rerunTierRef.current = false;
       setBusy(false);
     }
+    return true;
+  }
+
+  /** 出谱后切换档位：用原曲字节重跑分轨与转写；转写中禁止切档。 */
+  useEffect(() => {
+    const current = sourceSettingsRef.current;
+    const source = activeFileRef.current;
+    if (!current || !source || busy || rerunTierRef.current) return;
+    const changed =
+      current.tier !== settings.tier ||
+      (settings.tier === 'light' && current.bandpass !== settings.bandpass);
+    if (!changed) return;
+    current.tier = settings.tier;
+    current.bandpass = settings.bandpass;
+    rerunTierRef.current = true;
+    void transcribeFile(source);
+  }, [settings.tier, settings.bandpass, busy]);
+
+  /**
+   * 均衡/高配必须先从混音提取 guitar.wav，再走与轻量档相同的 Basic Pitch。
+   * 失败时由 TierRouter 返回 light 并带 notice，不会把原曲伪装成已分轨。
+   */
+  async function prepareTierSource(
+    originalBytes: Uint8Array,
+    tier: SeparationTier,
+    signal: AbortSignal,
+  ): Promise<{ samples: Float32Array; sampleRate: number }> {
+    if (!isDesktopRuntime()) {
+      const notice = '当前浏览器无法运行分轨引擎，已自动回落轻量档直接转写';
+      separationNoticeRef.current = notice;
+      setStatus(`${notice}…`);
+      return preprocessAudio(originalBytes.buffer as ArrayBuffer, {
+        bandpass: settings.bandpass,
+      });
+    }
+
+    const originalBuffer = await decodeToAudioBuffer(originalBytes.buffer as ArrayBuffer);
+    const inputPcm = await audioBufferToSamples(originalBuffer);
+    const separationInput = encodePcm16Wav(inputPcm.samples, inputPcm.sampleRate);
+    const fs = await prepareDesktopFs();
+    const unsubscribe = subscribeDesktopSeparation((event) => {
+      if (event.stream === 'stdout') {
+        const pct = /progress[=:]\s*(\d+(?:\.\d+)?)/i.exec(event.data);
+        if (pct) {
+          setStatus(
+            `分轨中（${tier === 'balanced' ? '均衡档' : '高配档'}）… ${Math.round(Number(pct[1]))}%`,
+          );
+        }
+      }
+    });
+    try {
+      const routed = await routeTier({
+        tier,
+        inputPath: 'input.wav',
+        inputBytes: () => Promise.resolve(separationInput),
+        workRoot: 'runtime',
+        fs,
+        signal,
+        isRuntimeAvailable: () => true,
+        runSeparationImpl: (_input, opts) =>
+          runDesktopSeparation(separationInput, {
+            ...opts,
+            tier,
+            fs,
+            signal,
+          }),
+        onNotice: (notice) => {
+          separationNoticeRef.current = notice;
+        },
+        onProgress: (pct) =>
+          setStatus(
+            `分轨中（${tier === 'balanced' ? '均衡档' : '高配档'}）… ${Math.round(pct)}%`,
+          ),
+      });
+      if (routed.notice) {
+        separationNoticeRef.current = routed.notice;
+      }
+      if (routed.mode === 'light') {
+        return preprocessAudio(originalBytes.buffer as ArrayBuffer, {
+          bandpass: settings.bandpass,
+        });
+      }
+      const guitarPath = routed.stems.guitar;
+      if (!guitarPath) throw new Error('分轨结果缺少 guitar.wav');
+      const guitarBytes = await fs.readFile(guitarPath);
+      const audioBuffer = await decodeToAudioBuffer(guitarBytes.buffer as ArrayBuffer);
+      return audioBufferToSamples(audioBuffer);
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  /**
+   * 桌面分轨的 stem 字节需要经 FsAdapter 交给 TierRouter 缓存。
+   * 若 WebView 的 OPFS 不可用，则用一次性内存适配器；分轨结果仍会写入
+   * stems-cache 并由当前转写消费，但跨重启的 OPFS 缓存需平台支持。
+   */
+  function prepareDesktopFs(): Promise<FsAdapter> {
+    return OpfsFsAdapter.isSupported()
+      ? OpfsFsAdapter.create('.agtp')
+      : Promise.resolve(new MemoryFsAdapter());
   }
 
   /** BPM 检测 + Basic Pitch 推理（变速重置时对缓存的前处理产物重跑） */
@@ -433,6 +727,8 @@ function Workspace() {
     startedAt: number,
     note?: string,
   ) {
+    const previousNotes = notesSourceRef.current;
+    const previousSections = tempoSections;
     samplesRef.current = pre;
     const durationSec = pre.samples.length / pre.sampleRate;
     const chunkNote =
@@ -449,10 +745,20 @@ function Workspace() {
     notesSourceRef.current = raw;
     setIsRealAudio(true);
     ignoredRef.current = new Set();
+    // 面板与本次实际用于出谱的节拍分段保持一致，替换上一首或演示曲的状态。
+    setTempoSections(sections);
+    tempoUndoRef.current = null;
     setTempoCandidates([]);
     setAutoApplied(null);
     const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
-    await runTranscription(raw, sections, `${note ? `${note} · ` : ''}${bpms} BPM · 耗时 ${elapsed}s`);
+    const ok = await runTranscription(raw, sections, `${note ? `${note} · ` : ''}${bpms} BPM · 耗时 ${elapsed}s`);
+    if (!ok) {
+      // 出谱失败时还原转写上下文，避免旧谱面与新音频状态混用。
+      notesSourceRef.current = previousNotes;
+      setTempoSections(previousSections);
+      return false;
+    }
+    return true;
   }
 
   /** 加载演示点击轨（§3.5 网格 overlay 验证：拍点与演示曲一致，可听出 80→60 变速） */
@@ -467,6 +773,14 @@ function Workspace() {
   }
 
   function clearAudio() {
+    activeAbortRef.current?.abort();
+    runRevisionRef.current += 1;
+    activeFileRef.current = null;
+    sourceSettingsRef.current = null;
+    notesSourceRef.current = null;
+    samplesRef.current = null;
+    rerunTierRef.current = false;
+    resetCopilotContext();
     if (audio) URL.revokeObjectURL(audio.url);
     setAudio(null);
     setBackingOn(false);
@@ -478,7 +792,8 @@ function Workspace() {
   useEffect(() => {
     const el = backingAudioRef.current;
     if (!tabApi || !el || !backingOn || !audio) return;
-    el.volume = 0.5;
+    el.volume = backingVolume;
+    el.playbackRate = speed;
     const sync = () => {
       const t = tabApi.timePosition / 1000;
       if (Math.abs(el.currentTime - t) > 0.15) el.currentTime = t;
@@ -506,7 +821,7 @@ function Workspace() {
       tabApi.playerPositionChanged.off(onPos);
       el.pause();
     };
-  }, [tabApi, backingOn, audio]);
+  }, [tabApi, backingOn, audio, backingVolume, speed]);
 
   return (
     <div className="flex h-full flex-col">
@@ -537,6 +852,8 @@ function Workspace() {
               backingOn={backingOn}
               backingAvailable={!!audio}
               onToggleBacking={() => setBackingOn((v) => !v)}
+              speed={speed}
+              onSpeedChange={setSpeed}
             />
           </motion.div>
           {settings.showWaveform && (
@@ -546,6 +863,9 @@ function Workspace() {
                 fileName={audio?.name ?? null}
                 onClear={clearAudio}
                 beatGrid={lastRun?.beatGrid ?? null}
+                backingAudioRef={backingAudioRef}
+                volume={backingVolume}
+                onVolumeChange={setBackingVolume}
               />
             </motion.div>
           )}
@@ -585,7 +905,7 @@ function Workspace() {
               hasResult={lastRun !== null}
               chords={chords}
               chordMeta={chordMeta}
-              copilotBusy={copilotBusy}
+              copilotBusy={copilotBusy || busy}
               connected={connection !== null}
               rewritePreview={rewritePreview}
               splitPreview={splitPreview}
@@ -599,7 +919,7 @@ function Workspace() {
               onRunSplit={runSplit}
               onApplySplit={(track) => {
                 if (!splitPreview) return;
-                applyAiTex(track === 'lead' ? splitPreview.lead : splitPreview.rhythm, `应用${track === 'lead' ? '主音' : '节奏'}轨`);
+                if (!applyAiTex(track === 'lead' ? splitPreview.lead : splitPreview.rhythm, `应用${track === 'lead' ? '主音' : '节奏'}轨`)) return;
                 setStatus(`已应用${track === 'lead' ? '主音（Lead）' : '节奏（Rhythm）'}轨为当前谱面 · 另一轨已丢弃 · 可撤销`);
               }}
               onDiscardSplit={() => setSplitPreview(null)}

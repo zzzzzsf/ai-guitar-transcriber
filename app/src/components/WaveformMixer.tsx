@@ -12,15 +12,24 @@ type Props = {
   onClear?: () => void;
   /** 当前变速表：在波形上叠加小节线（§3.5 网格 overlay，变速对错一眼可辨） */
   beatGrid?: BeatGrid | null;
+  /** 原曲对照播放器；音量/播放由同一控制面管理，避免双输出 */
+  backingAudioRef?: React.RefObject<HTMLAudioElement | null>;
+  /** 上层受控音量（原曲对照与波形共用同一推子） */
+  volume?: number;
+  onVolumeChange?: (v: number) => void;
 };
 
 /** 多轨波形与混音台（当前：单轨预览；分轨 Mute/Solo/推子随桌面外壳 + 分轨扩展包接入） */
-export default function WaveformMixer({ audioUrl, fileName, onClear, beatGrid }: Props) {
+export default function WaveformMixer({
+  audioUrl, fileName, onClear, beatGrid, backingAudioRef,
+  volume: controlledVolume, onVolumeChange,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
   const regionsRef = useRef<ReturnType<typeof RegionsPlugin.create> | null>(null);
   const [playing, setPlaying] = useState(false);
-  const [volume, setVolume] = useState(0.8);
+  const [fallbackVolume, setFallbackVolume] = useState(0.8);
+  const volume = controlledVolume ?? fallbackVolume;
   const [ready, setReady] = useState(false);
   const { settings } = useSettings();
   const accentFrom = ACCENT_THEMES[settings.themeAccent].from;
@@ -38,6 +47,7 @@ export default function WaveformMixer({ audioUrl, fileName, onClear, beatGrid }:
     regionsRef.current = regions;
     const ws = WaveSurfer.create({
       container: containerRef.current,
+      media: backingAudioRef?.current ?? undefined,
       height: 64,
       waveColor,
       progressColor: accentFrom,
@@ -76,7 +86,7 @@ export default function WaveformMixer({ audioUrl, fileName, onClear, beatGrid }:
     if (!regions || !ready) return;
     regions.clearRegions();
     if (!beatGrid) return;
-    const { starts } = barStartsFromSections(beatGrid.sections, 400);
+    const { starts } = barStartsFromSections(beatGrid.sections);
     starts.forEach((t, i) => {
       regions.addRegion({
         start: t,
@@ -93,7 +103,12 @@ export default function WaveformMixer({ audioUrl, fileName, onClear, beatGrid }:
     <div className="glass px-4 py-3">
       <div className="mb-2 flex items-center gap-3">
         <button
-          onClick={() => wsRef.current?.playPause()}
+          onClick={() => {
+            const el = backingAudioRef?.current;
+            if (!el) return;
+            if (el.paused) void el.play().catch(() => {});
+            else el.pause();
+          }}
           disabled={!ready}
           className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-accent transition-colors hover:bg-white/15 disabled:opacity-40"
         >
@@ -122,7 +137,8 @@ export default function WaveformMixer({ audioUrl, fileName, onClear, beatGrid }:
             value={volume}
             onChange={(e) => {
               const v = Number(e.target.value);
-              setVolume(v);
+              if (onVolumeChange) onVolumeChange(v);
+              else setFallbackVolume(v);
               wsRef.current?.setVolume(v);
             }}
             className="w-20"

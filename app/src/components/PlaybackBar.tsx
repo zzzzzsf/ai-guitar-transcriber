@@ -33,6 +33,9 @@ function parseKeySelection(v: string): KeySelection | null {
 
 type Props = {
   api: AlphaTabApi | null;
+  /** 上层受控播放速度：原曲 audio 需要同步同一个速度 */
+  speed?: number;
+  onSpeedChange?: (speed: number) => void;
   /** 当前转谱的调性检测结果（显示用） */
   detectedKey?: KeyResult | null;
   keyOverride?: KeySelection | null;
@@ -46,6 +49,8 @@ type Props = {
 /** 谱面播放控制条 + 练习模式（§3.4：节拍器/倒计时/A-B 循环均为 alphaTab 现成 API） */
 export default function PlaybackBar({
   api,
+  speed: controlledSpeed,
+  onSpeedChange,
   detectedKey,
   keyOverride,
   onKeyOverride,
@@ -54,7 +59,9 @@ export default function PlaybackBar({
   onToggleBacking,
 }: Props) {
   const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState(1);
+  const [playerReady, setPlayerReady] = useState(false);
+  const [fallbackSpeed, setFallbackSpeed] = useState(1);
+  const speed = controlledSpeed ?? fallbackSpeed;
   // 练习模式
   const [metronome, setMetronome] = useState(false);
   const [countIn, setCountIn] = useState(false);
@@ -63,12 +70,31 @@ export default function PlaybackBar({
   const [looping, setLooping] = useState(false);
 
   useEffect(() => {
+    if (!api) {
+      setPlayerReady(false);
+      return;
+    }
+    const updateReady = () => setPlayerReady(api.isReadyForPlayback);
+    updateReady();
+    api.playerReady.on(updateReady);
+    return () => api.playerReady.off(updateReady);
+  }, [api]);
+
+  useEffect(() => {
     if (!api) return;
     const handler = (args: { state: number }) => {
       setPlaying(args.state === PLAYER_STATE_PLAYING);
     };
     api.playerStateChanged.on(handler);
     return () => api.playerStateChanged.off(handler);
+  }, [api]);
+
+  // Loop endpoints belong to the current score. Replacing the alphaTex must
+  // reset A/B and stop the old range from being re-applied to a new song.
+  useEffect(() => {
+    setLoopA(null);
+    setLoopB(null);
+    setLooping(false);
   }, [api]);
 
   useEffect(() => {
@@ -87,13 +113,20 @@ export default function PlaybackBar({
   useEffect(() => {
     if (!api) return;
     if (looping) {
-      if (loopA !== null && loopB !== null) {
+      const start = Math.min(loopA ?? 0, loopB ?? Number.MAX_SAFE_INTEGER);
+      const end = Math.max(loopA ?? 0, loopB ?? Number.MAX_SAFE_INTEGER);
+      const scoreEnd = api.score?.masterBars.reduce(
+        (barEnd, bar) => Math.max(barEnd, bar.start + bar.calculateDuration()), 0,
+      ) ?? 0;
+      if (Number.isFinite(start) && Number.isFinite(end) && start < end && end > 0 && start < scoreEnd) {
         api.playbackRange = {
-          startTick: Math.min(loopA, loopB),
-          endTick: Math.max(loopA, loopB),
+          startTick: start,
+          endTick: Math.min(end, scoreEnd),
         };
+      } else {
+        api.playbackRange = null;
       }
-      api.isLooping = true;
+      api.isLooping = api.playbackRange !== null;
     } else {
       api.isLooping = false;
       api.playbackRange = null;
@@ -105,15 +138,15 @@ export default function PlaybackBar({
       <div className="flex items-center gap-1.5">
         <button
           onClick={() => (playing ? api?.pause() : api?.play())}
-          disabled={!api}
-          title={playing ? '暂停' : '播放'}
+          disabled={!api || !playerReady}
+          title={!playerReady ? '播放器正在加载音源…' : playing ? '暂停' : '播放'}
           className="flex h-9 w-9 items-center justify-center rounded-full bg-accent-grad text-white shadow-accent transition-transform hover:scale-105 disabled:opacity-40 disabled:hover:scale-100"
         >
           {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 translate-x-[1px]" />}
         </button>
         <button
           onClick={() => api?.stop()}
-          disabled={!api}
+          disabled={!api || !playerReady}
           title="停止"
           className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-zinc-400 transition-colors hover:text-zinc-200 disabled:opacity-40"
         >
@@ -129,7 +162,11 @@ export default function PlaybackBar({
           max={2}
           step={0.05}
           value={speed}
-          onChange={(e) => setSpeed(Number(e.target.value))}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            if (onSpeedChange) onSpeedChange(v);
+            else setFallbackSpeed(v);
+          }}
           className="w-24"
         />
         <span className="w-9 tabular-nums text-zinc-300">{speed.toFixed(2)}x</span>

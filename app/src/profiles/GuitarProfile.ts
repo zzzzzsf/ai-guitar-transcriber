@@ -570,14 +570,18 @@ export const detectArticulation: DetectArticulation = (notes) => {
 
 // ---------- 6. 生成 alphaTex ----------
 
-function durValue(beats: number): number {
-  const clamped = Math.min(Math.max(beats, 0.125), 4);
-  const v = Math.round(Math.log2(4 / clamped));
-  return 2 ** Math.min(Math.max(v, 0), 5);
-}
-
-function beatsOf(value: number): number {
-  return 4 / value;
+// Existing binary export grid: eight 32nd notes per quarter note. Quantize
+// endpoints once, then decompose integer spans without rounding each fragment.
+const TEX_UNITS_PER_BEAT = 8;
+function durationParts(units: number): { value: number; units: number }[] {
+  const parts: { value: number; units: number }[] = [];
+  for (const size of [32, 16, 8, 4, 2, 1]) {
+    while (units >= size) {
+      parts.push({ value: 32 / size, units: size });
+      units -= size;
+    }
+  }
+  return parts;
 }
 
 /**
@@ -622,6 +626,7 @@ export const toAlphaTex: ToAlphaTex = (notes, ctx) => {
       ? ctx.beatGrid.sections
       : [{ start: 0, end: Number.MAX_SAFE_INTEGER / 8, bpm: 120, timeSignature: [4, 4] as [number, number] }];
   const tsNum = sections[0].timeSignature?.[0] ?? 4;
+  const unitsPerBar = tsNum * TEX_UNITS_PER_BEAT;
   const capo = ctx.tuning?.capo ?? ctx.config.capo ?? 0;
   const tuning = ctx.tuning?.tuning ?? ctx.config.tuning ?? STANDARD_TUNING;
 
@@ -634,8 +639,24 @@ export const toAlphaTex: ToAlphaTex = (notes, ctx) => {
     ? '\\track "Guitar" \\instrument 25'
     : `\\track "Guitar" \\instrument 25 \\tuning ${[...tuning].reverse().map(midiName).join(' ')}`;
 
-  // 小节边界表（每段小节长度随 BPM 变化）
-  const { starts: barStarts, bpms: barBpms } = barStartsFromSections(sections);
+  // Explicit finite grid endings also preserve source-audio trailing silence.
+  // The default unbounded section is not an audio duration. The last tempo
+  // continues when a note sustains beyond the supplied grid's end.
+  const lastNoteEnd = visible.reduce((end, n) => Math.max(end, n.onset + n.duration), 0);
+  const sourceEnd = ctx.beatGrid?.sections?.reduce(
+    (end, s) => Number.isFinite(s.end) ? Math.max(end, s.end) : end, 0,
+  ) ?? 0;
+  const extentSeconds = Math.max(lastNoteEnd, sourceEnd);
+  const boundedSections = sections.map((s, i) => ({
+    ...s,
+    end: Math.min(
+      i === sections.length - 1 ? Math.max(s.end, extentSeconds) : s.end,
+      extentSeconds,
+    ),
+  }));
+  const shortestBarSeconds = Math.min(...sections.map((s) => (s.timeSignature?.[0] ?? 4) * 60 / s.bpm));
+  const boundaryLimit = Math.max(1, Math.ceil(extentSeconds / shortestBarSeconds) + sections.length + 1);
+  const { starts: barStarts, bpms: barBpms } = barStartsFromSections(boundedSections, boundaryLimit);
   const findBar = (t: number): number => {
     let lo = 0;
     let hi = barStarts.length - 1;
@@ -655,61 +676,111 @@ export const toAlphaTex: ToAlphaTex = (notes, ctx) => {
   const isSectionStart = (t: number): boolean =>
     sectionStarts.some((st) => Math.abs(st - t) < 1e-6);
 
-  const barCount = visible.length
-    ? Math.max(...visible.map((n) => findBar(n.onset))) + 1
-    : 1;
+  const gridPositionOf = (time: number): number => {
+    const b = findBar(time);
+    return b * unitsPerBar + (time - barStarts[b]) * barBpms[b] / 60 * TEX_UNITS_PER_BEAT;
+  };
+  const positionOf = (time: number): number => Math.round(gridPositionOf(time));
+  type Event = { start: number; end: number; notes: FrettedNote[] };
+  const byTiming = new Map<string, Event[]>();
+  for (const n of visible) {
+    const start = positionOf(n.onset);
+    const end = Math.max(start + 1, positionOf(n.onset + n.duration));
+    const key = `${start}:${end}:${n.tuplet ?? ''}`;
+    const simultaneous = byTiming.get(key) ?? [];
+    // A chord can share a beat only when both endpoints match. Duplicate
+    // strings need separate voices too; don't let the parser overwrite a note.
+    const chord = simultaneous.find((event) => !event.notes.some((other) => other.string === n.string));
+    if (chord) chord.notes.push(n);
+    else simultaneous.push({ start, end, notes: [n] });
+    byTiming.set(key, simultaneous);
+  }
+  const events = [...byTiming.values()].flat().sort((a, b) =>
+    a.start - b.start || Math.max(...b.notes.map((n) => n.pitch)) - Math.max(...a.notes.map((n) => n.pitch))
+    || a.end - b.end,
+  );
+  type Fragment = { start: number; end: number; notes: FrettedNote[]; continuation: boolean };
+  type Voice = { end: number; strings: Set<number>; fragments: Map<number, Fragment[]> };
+  const voices: Voice[] = [{ end: 0, strings: new Set(), fragments: new Map() }];
+  let scoreEnd = Math.ceil(gridPositionOf(sourceEnd) - 1e-8);
+  for (const ev of events) {
+    const { start, end } = ev;
+    // Interval partitioning: a voice is reusable only after all its notes end.
+    // Overlapping events get an independent clock on the same guitar staff.
+    const available = voices.filter((candidate) => candidate.end <= start);
+    // Keep successive notes on a string together when possible, so allocating
+    // an otherwise free voice does not break hammer/slide connections.
+    let voice = available.find((candidate) => ev.notes.some((n) => candidate.strings.has(n.string))) ?? available[0];
+    if (!voice) {
+      voice = { end: 0, strings: new Set(), fragments: new Map() };
+      voices.push(voice);
+    }
+    voice.end = end;
+    voice.strings = new Set(ev.notes.map((n) => n.string));
+    scoreEnd = Math.max(scoreEnd, end);
+    for (let position = start; position < end;) {
+      const b = Math.floor(position / unitsPerBar);
+      const partEnd = Math.min(end, (b + 1) * unitsPerBar);
+      const parts = voice.fragments.get(b) ?? [];
+      parts.push({
+        start: position - b * unitsPerBar,
+        end: partEnd - b * unitsPerBar,
+        notes: ev.notes,
+        continuation: position > start,
+      });
+      voice.fragments.set(b, parts);
+      position = partEnd;
+    }
+  }
+  const barCount = Math.max(1, Math.ceil(scoreEnd / unitsPerBar));
   // 调号（§3.3 第 1 项）：手动指定优先于自动检测；在每个段落起始小节输出 \ks
   const keySel: KeySelection | null =
     ctx.keyOverride ?? (ctx.key ? { tonicPc: ctx.key.tonicPc, mode: ctx.key.mode } : null);
   const keyToken = keySel ? keyToAlphaTexToken(keySel.tonicPc, keySel.mode) : null;
-  const bars: string[] = [];
-  for (let b = 0; b < barCount; b++) {
-    const barStart = barStarts[b];
-    const bpm = barBpms[b];
-    const beatSec = 60 / bpm;
-    const inBar = visible.filter((n) => findBar(n.onset) === b);
-    inBar.sort((a, b2) => a.onset - b2.onset);
-
-    const tokens: string[] = [];
-    if (b > 0 && isSectionStart(barStart)) tokens.push(`\\tempo ${Math.round(bpm)}`);
-    if (keyToken && isSectionStart(barStart)) tokens.push(`\\ks ${keyToken}`);
-    let cursor = 0;
-    const events: { time: number; notes: FrettedNote[] }[] = [];
-    for (const n of inBar) {
-      const last = events[events.length - 1];
-      if (last && n.onset - last.time <= 0.01) last.notes.push(n);
-      else events.push({ time: n.onset, notes: [n] });
-    }
-    for (const ev of events) {
-      const evBeats = (ev.time - barStart) / beatSec;
-      let gap = evBeats - cursor;
-      if (gap >= 0.249) {
-        const v = durValue(gap);
-        tokens.push(`:${v} r`);
-        cursor += beatsOf(v);
+  const voiceTexts = voices.map((voice, voiceIndex) => {
+    const bars: string[] = [];
+    for (let b = 0; b < barCount; b++) {
+      const bpm = barBpms[b] ?? barBpms[barBpms.length - 1];
+      const barStart = barStarts[b] ?? barStarts[barStarts.length - 1]
+        + (b - barStarts.length + 1) * tsNum * 60 / bpm;
+      const inBar = voice.fragments.get(b) ?? [];
+      const tokens: string[] = [];
+      // Tempo and key belong to the shared master bar, not each voice.
+      if (voiceIndex === 0) {
+        if (b > 0 && isSectionStart(barStart)) tokens.push(`\\tempo ${Math.round(bpm)}`);
+        if (keyToken && isSectionStart(barStart)) tokens.push(`\\ks ${keyToken}`);
       }
-      const durBeats = Math.min(
-        Math.max(ev.notes[0].duration / beatSec, 0.125),
-        tsNum - cursor,
-      );
-      const value = durValue(Math.max(durBeats, 0.125));
-      const noteTokens = ev.notes
-        .map((n) => `${n.fret}.${n.string}${noteEffectsOf(n)}`)
-        .join(' ');
-      const beat = beatEffectsOf(ev.notes);
-      tokens.push(`:${value} ${noteTokens}${beat ? ` ${beat}` : ''}`);
-      cursor += beatsOf(value);
+      let cursor = 0;
+      const appendRests = (units: number) => {
+        for (const part of durationParts(units)) {
+          tokens.push(`:${part.value} r`);
+          cursor += part.units;
+        }
+      };
+      for (const fragment of inBar) {
+        appendRests(fragment.start - cursor);
+        let continuation = fragment.continuation;
+        for (const part of durationParts(fragment.end - fragment.start)) {
+          const noteTokens = fragment.notes
+            .map((n) => continuation ? `-.${n.string}` : `${n.fret}.${n.string}${noteEffectsOf(n)}`)
+            .join(' ');
+          const eventToken = fragment.notes.length > 1 ? `(${noteTokens})` : noteTokens;
+          // Attack effects belong on the original note, not every tied fragment.
+          // Tuplet markers are preserved; their rhythm is still tracked in #028.
+          const beat = continuation ? '' : beatEffectsOf(fragment.notes);
+          tokens.push(`:${part.value} ${eventToken}${beat ? ` ${beat}` : ''}`);
+          cursor += part.units;
+          continuation = true;
+        }
+      }
+      appendRests(unitsPerBar - cursor);
+      bars.push(tokens.join(' '));
     }
-    let tail = tsNum - cursor;
-    while (tail >= 0.249) {
-      const v = durValue(tail);
-      tokens.push(`:${v} r`);
-      tail -= beatsOf(v);
-    }
-    bars.push(tokens.join(' '));
-  }
+    // A parameterless \\voice starts another independent first-bar timeline.
+    return `${voices.length > 1 ? '\\voice\n' : ''}${bars.join(' | ')}`;
+  });
 
-  return [header.join(' '), '.', trackLine, bars.join(' | ')].join('\n');
+  return [header.join(' '), '.', trackLine, voiceTexts.join('\n')].join('\n');
 };
 
 // ---------- Profile 组装 ----------

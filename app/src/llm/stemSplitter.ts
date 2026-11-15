@@ -12,6 +12,7 @@
 import { z } from 'zod';
 import { chatWith, extractJson, LlmError, type LlmChatOptions, type LlmConfig, type LlmMessage } from './llmClient';
 import { SPLIT_SYSTEM_PROMPT, buildSplitUserPrompt } from './guitarPrompts';
+import * as alphaTab from '@coderline/alphatab';
 import { extractAlphaTex, reviewTexEdit, type TexEditReview } from './texGuard';
 
 const SplitPayloadSchema = z.object({
@@ -48,6 +49,61 @@ function reviewTrack(before: string, track: string, label: string): { ok: true; 
   return { ok: true, review };
 }
 
+/** Union review for split tracks: the original notes must be conserved, not
+ *  duplicated across tracks or deleted. */
+function unionReview(original: alphaTab.model.Score, lead: alphaTab.model.Score, rhythm: alphaTab.model.Score): { ok: true } | { ok: false; issues: string[] } {
+  const notesOf = (score: alphaTab.model.Score): { note: string }[] => {
+    const out: { note: string }[] = [];
+    score.tracks.forEach((track) => {
+      track.staves.forEach((staff) => {
+        staff.bars.forEach((bar) => {
+          bar.voices.forEach((voice) => {
+            voice.beats.forEach((beat) => {
+              beat.notes.forEach((note) => {
+                out.push({ note: JSON.stringify({
+                  start: beat.playbackStart + bar.masterBar.start,
+                  duration: beat.playbackDuration,
+                  pitch: note.realValue,
+                  tie: note.isTieDestination,
+                }) });
+              });
+            });
+          });
+        });
+      });
+    });
+    return out;
+  };
+  const before = notesOf(original);
+  const after = [...notesOf(lead), ...notesOf(rhythm)];
+  const count = (items: { note: string }[]) => {
+    const out = new Map<string, number>();
+    for (const item of items) out.set(item.note, (out.get(item.note) ?? 0) + 1);
+    return out;
+  };
+  const originalCounts = count(before);
+  const splitCounts = count(after);
+  const issues: string[] = [];
+  for (const [note, expected] of originalCounts) {
+    const actual = splitCounts.get(note) ?? 0;
+    if (actual !== expected) {
+      issues.push(`原音 ${note} 在双轨中被复制或删除（期望 ${expected}，实际 ${actual}）`);
+    }
+    if (actual > 1) issues.push(`原音 ${note} 被分配到多个声轨`);
+  }
+  for (const note of splitCounts.keys()) {
+    if (!originalCounts.has(note)) issues.push(`双轨引入了原谱不存在的音 ${note}`);
+  }
+  if (issues.length) return { ok: false, issues };
+  return { ok: true };
+}
+
+function readScore(tex: string): alphaTab.model.Score {
+  const importer = new alphaTab.importer.AlphaTexImporter();
+  importer.initFromString(tex, new alphaTab.Settings());
+  return importer.readScore();
+}
+
 export async function splitGuitars(input: SplitInput): Promise<SplitResult> {
   if (!input.llm) throw new LlmError('badRequest', '双吉他拆轨需要连接大模型（无本地降级）');
   const chat =
@@ -82,7 +138,12 @@ export async function splitGuitars(input: SplitInput): Promise<SplitResult> {
     }
     const leadCheck = reviewTrack(input.alphaTex, parsed.data.lead, 'Lead');
     const rhythmCheck = reviewTrack(input.alphaTex, parsed.data.rhythm, 'Rhythm');
+    let unionCheck: { ok: true } | { ok: false; issues: string[] } = { ok: true };
     if (leadCheck.ok && rhythmCheck.ok) {
+      const original = readScore(input.alphaTex);
+      unionCheck = unionReview(original, readScore(parsed.data.lead), readScore(parsed.data.rhythm));
+    }
+    if (leadCheck.ok && rhythmCheck.ok && unionCheck.ok) {
       return {
         lead: extractAlphaTex(parsed.data.lead)!,
         rhythm: extractAlphaTex(parsed.data.rhythm)!,
@@ -92,6 +153,7 @@ export async function splitGuitars(input: SplitInput): Promise<SplitResult> {
     const issues = [
       ...(leadCheck.ok ? [] : leadCheck.issues),
       ...(rhythmCheck.ok ? [] : rhythmCheck.issues),
+      ...(unionCheck.ok ? [] : unionCheck.issues),
     ];
     messages.push({ role: 'assistant', content: text.slice(0, 2000) });
     messages.push({ role: 'user', content: SPLIT_REPAIR_PROMPT.replace('{issues}', issues.join('\n')) });

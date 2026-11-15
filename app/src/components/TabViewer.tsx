@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlphaTabApi, LayoutMode, ScrollMode } from '@coderline/alphatab';
+import { AlphaTabApi, LayoutMode } from '@coderline/alphatab';
 import { ACCENT_THEMES, resolveNoteHex } from '../settings';
+import { createTabPlayerSettings } from './tabViewerConfig';
 
 export type TabDisplaySettings = {
   /** 谱面缩放（display.scale） */
@@ -90,11 +91,7 @@ export default function TabViewer({ tex, display, onApiReady }: Props) {
             scoreInfoColor: noteColorHex,
           },
         },
-        player: {
-          soundFont: '/soundfont/sonivox.sf2',
-          scrollMode: d.followPlayback ? ScrollMode.Continuous : ScrollMode.Off,
-          enableCursor: d.showCursor,
-        },
+        player: createTabPlayerSettings(d, containerRef.current ?? undefined),
       });
       instance.error.on((e) => console.error('[alphaTab]', e));
       instance.masterVolume = d.masterVolume;
@@ -149,7 +146,7 @@ export default function TabViewer({ tex, display, onApiReady }: Props) {
   // 滚动/光标热更新
   useEffect(() => {
     if (!api) return;
-    api.settings.player.scrollMode = display.followPlayback ? ScrollMode.Continuous : ScrollMode.Off;
+    api.settings.player.scrollMode = createTabPlayerSettings(display, containerRef.current ?? undefined).scrollMode;
     api.settings.player.enableCursor = display.showCursor;
     api.updateSettings();
   }, [api, display.followPlayback, display.showCursor]);

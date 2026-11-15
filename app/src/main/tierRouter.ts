@@ -15,10 +15,11 @@
 import type { PerformanceTier } from '../types';
 import { joinPath, type FsAdapter } from '../io/fsAdapter';
 import {
-  isSidecarRuntimeAvailable,
   runSeparation,
   SeparatorError,
   type SeparationTier,
+  type RunSeparationOpts,
+  type SeparationResult,
   type StemName,
 } from './separatorRunner';
 import { cacheKeyOf, findStems, saveStems } from './stemsCache';
@@ -50,8 +51,14 @@ export type RouteTierOpts = {
   signal?: AbortSignal;
   timeoutMs?: number;
   /** 测试注入分轨实现 */
-  runSeparationImpl?: typeof runSeparation;
+  runSeparationImpl?: (input: string, opts: RunSeparationOpts) => Promise<SeparationResult>;
+  /** 测试 / 其他宿主可显式声明运行时可用；缺省按 Node 子进程能力探测。 */
+  isRuntimeAvailable?: () => boolean;
 };
+
+function nodeRuntimeAvailable(): boolean {
+  return typeof process !== 'undefined' && !!process.versions?.node;
+}
 
 const TIER_LABEL: Record<SeparationTier, string> = { balanced: '均衡档', pro: '高配档' };
 
@@ -70,16 +77,18 @@ export async function routeTier(opts: RouteTierOpts): Promise<TierRouteOutcome> 
     return { mode: 'sidecar', tier, usedStem: 'guitar', stems: cached, fromCache: true, notice };
   }
 
-  if (!isSidecarRuntimeAvailable()) {
-    const notice = '当前运行时无分轨 sidecar（需桌面外壳），已自动回落轻量档直接转写';
+  const available =
+    opts.isRuntimeAvailable ??
+    (opts.runSeparationImpl ? () => true : nodeRuntimeAvailable);
+  if (!available()) {
+    const notice = '分轨引擎当前不可用，已自动回落轻量档直接转写';
     opts.onNotice?.(notice);
     return { mode: 'light', usedStem: 'original', degradedFrom: tier, notice };
   }
 
   const outDir = joinPath(opts.workRoot, 'stems-work', `${hash}-${tier}`);
-  const separate = opts.runSeparationImpl ?? runSeparation;
   try {
-    const result = await separate(opts.inputPath, {
+    const result = await (opts.runSeparationImpl ?? runSeparation)(opts.inputPath, {
       tier,
       outDir,
       fs: opts.fs,
@@ -88,6 +97,9 @@ export async function routeTier(opts: RouteTierOpts): Promise<TierRouteOutcome> 
       signal: opts.signal,
       timeoutMs: opts.timeoutMs,
     });
+    if (!result.stems.guitar) {
+      throw new SeparatorError('missing', '分轨结果缺少 guitar.wav');
+    }
 
     // 产物搬进缓存目录（guitar.wav 必在 —— runSeparation 已校验）
     const stemBytes: Record<string, Uint8Array> = {};

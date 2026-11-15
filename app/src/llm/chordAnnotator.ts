@@ -38,7 +38,7 @@ const ChordsPayloadSchema = z.preprocess(
 );
 
 /** 根音 + 常见后缀 + 可选斜杠低音；大小写混合统一根音大写 */
-const CHORD_NAME_RE = /^([A-Ga-g])([#b]?)([A-Za-z0-9()#b+,\s]{0,10})(?:\/([A-Ga-g])([#b]?))?$/;
+const CHORD_NAME_RE = /^([A-Ga-g])([#b]?)(m7b5|maj7|sus2|sus4|add9|dim|aug|m7|m|7|6|9|5)?(?:\/([A-Ga-g])([#b]?))?$/;
 
 const ROOT_FIX: Record<string, string> = {
   c: 'C', d: 'D', e: 'E', f: 'F', g: 'G', a: 'A', b: 'B',
@@ -50,8 +50,8 @@ export function normalizeChordName(name: string): string | null {
   if (!m) return null;
   const [, rootLetter, rootAcc, suffixRaw, bassLetter, bassAcc] = m;
   const root = `${ROOT_FIX[rootLetter.toLowerCase()] ?? rootLetter.toUpperCase()}${rootAcc ?? ''}`;
-  // 后缀去掉空格；首字符若与根音重复大小写混淆（如 "EM"）统一小写化已知后缀
-  const suffix = suffixRaw.replace(/\s+/g, '');
+  // 后缀采用与模型输出契约一致的白名单，拒绝任意字母串。
+  const suffix = suffixRaw ?? '';
   const bass = bassLetter ? `/${ROOT_FIX[bassLetter.toLowerCase()] ?? bassLetter.toUpperCase()}${bassAcc ?? ''}` : '';
   const full = `${root}${suffix}${bass}`;
   return full.length > 24 ? null : full;
@@ -159,7 +159,8 @@ export function validateAndNormalize(raw: { bar: number; name: string }[], barCo
       rejected += 1;
       continue;
     }
-    byBar.set(item.bar, { bar: item.bar, name });
+    // 模型契约为 1 基；ChordLabel 及本地检测/UI 内部使用 0 基。
+    byBar.set(item.bar, { bar: item.bar - 1, name });
   }
   const chords = [...byBar.entries()].sort((a, b) => a[0] - b[0]).map(([, label]) => label);
   return { chords, kept: chords.length, rejected };

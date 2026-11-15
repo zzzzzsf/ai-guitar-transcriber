@@ -675,8 +675,9 @@ export function buildTempoMap(
   steps: { time: number; bpm: number }[],
 ): BeatSection[] {
   const clean = steps
+    .filter((s) => Number.isFinite(s.time) && s.time >= 0 && Number.isFinite(s.bpm))
     .map((s) => ({ time: Math.max(0, Math.min(s.time, durationSec - 1e-6)), bpm: Math.min(400, Math.max(30, s.bpm)) }))
-    .filter((s) => s.time > 1e-6 && s.time < durationSec - 1e-6)
+    .filter((s) => s.time >= 0 && s.time < durationSec - 1e-6)
     .sort((a, b) => a.time - b.time);
   const sections: BeatSection[] = [];
   let cursor = 0;
@@ -699,6 +700,26 @@ export function buildTempoMap(
     else merged.push({ ...s });
   }
   return merged;
+}
+
+/** 在已有变速表上应用候选，保留未被该候选覆盖的分段和曲长。 */
+export function applyTempoCandidates(base: BeatSection[], candidates: TempoCandidate[]): BeatSection[] {
+  if (!base.length) return [];
+  const signature = base[0].timeSignature ?? [4, 4];
+  let steps = base.slice(1).map((s) => ({ time: s.start, bpm: s.bpm }));
+  for (const candidate of candidates) {
+    const end = candidate.gradient ? candidate.endTime : undefined;
+    if (end !== undefined && end > candidate.time) {
+      steps = steps.filter((s) => s.time < candidate.time || s.time > end);
+      steps.push(...expandGradientToSteps({
+        start: candidate.time, end, from: candidate.bpmBefore, to: candidate.bpmAfter,
+      }, signature));
+    } else {
+      steps = steps.filter((s) => Math.abs(s.time - candidate.time) > 1e-6);
+      steps.push({ time: candidate.time, bpm: candidate.bpmAfter });
+    }
+  }
+  return buildTempoMap(base[base.length - 1].end, signature, base[0].bpm, steps);
 }
 
 /** 渐变候选展开：在 [start, end] 内按小节长度线性插值出逐段变速点（§3.5 渐变段处理） */
@@ -733,7 +754,7 @@ export function barStartTime(sections: BeatSection[], bar: number): number {
 /** 分段 → 小节起点/每小节 BPM 表（toAlphaTex 与波形网格 overlay 共用，上限 limit 根） */
 export function barStartsFromSections(
   sections: BeatSection[],
-  limit = 400,
+  limit = Number.POSITIVE_INFINITY,
 ): { starts: number[]; bpms: number[] } {
   const starts: number[] = [];
   const bpms: number[] = [];

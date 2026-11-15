@@ -228,4 +228,35 @@ describe('routeTier（TierRouter + 降级链 + stems 缓存）', () => {
     expect((second as { fromCache: boolean }).fromCache).toBe(true);
     expect((second as { stems: Record<string, string> }).stems.guitar).toMatch(/stems-cache\/.+\.wav$/);
   });
+
+  it('均衡/高配会实际读取 guitar.wav，并缓存为带档位后缀的谱面输入', async () => {
+    const fs = new MemoryFsAdapter();
+    const raw = textToBytes('RIFF-source');
+    const seen: string[] = [];
+    const out = await routeTier({
+      tier: 'pro',
+      inputPath: 'source.wav',
+      inputBytes: () => Promise.resolve(raw),
+      workRoot: 'work',
+      fs,
+      runSeparationImpl: async (_input, opts) => {
+        seen.push(opts.tier);
+        await fs.writeFile(`${opts.outDir}/guitar.wav`, textToBytes('RIFF-guitar'));
+        await fs.writeFile(`${opts.outDir}/bass.wav`, textToBytes('RIFF-bass'));
+        return {
+          stems: {
+            guitar: `${opts.outDir}/guitar.wav`,
+            bass: `${opts.outDir}/bass.wav`,
+          },
+          stemsDir: opts.outDir,
+        };
+      },
+    });
+    expect(seen).toEqual(['pro']);
+    expect(out.mode).toBe('sidecar');
+    if (out.mode !== 'sidecar') throw new Error('unreachable');
+    expect(out.stems.guitar).toMatch(/stems-cache\/.+pro\/guitar\.wav$/);
+    expect(await fs.readFile(out.stems.guitar!)).toEqual(textToBytes('RIFF-guitar'));
+    expect(out.stems.bass).toMatch(/stems-cache\/.+pro\/bass\.wav$/);
+  });
 });

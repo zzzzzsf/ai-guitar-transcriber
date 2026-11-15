@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { UploadCloud, AudioWaveform, ChevronRight } from 'lucide-react';
 import { useSettings } from '../settings';
 import { TIER_INFO } from '../types';
@@ -20,12 +20,17 @@ export default function AudioDropzone({ audio, onFile, onOpenSettings }: Props) 
   const [dragging, setDragging] = useState(false);
   const { settings } = useSettings();
   const tierInfo = TIER_INFO[settings.tier];
-  const inputRef = useCallback((el: HTMLInputElement | null) => {
-    el?.addEventListener('change', () => {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const onChange = () => {
       const f = el.files?.[0];
       if (f) onFile(f);
       el.value = '';
-    });
+    };
+    el.addEventListener('change', onChange);
+    return () => el.removeEventListener('change', onChange);
   }, [onFile]);
 
   return (
@@ -42,7 +47,7 @@ export default function AudioDropzone({ audio, onFile, onOpenSettings }: Props) 
           const f = e.dataTransfer.files?.[0];
           if (f) onFile(f);
         }}
-        onClick={() => document.getElementById('audio-file-input')?.click()}
+        onClick={() => inputRef.current?.click()}
         className={`flex cursor-pointer flex-col items-center gap-2 rounded-xl border border-dashed px-4 py-7 text-center transition-colors ${
           dragging
             ? 'border-accent-strong bg-accent-soft'
@@ -50,7 +55,6 @@ export default function AudioDropzone({ audio, onFile, onOpenSettings }: Props) 
         }`}
       >
         <input
-          id="audio-file-input"
           type="file"
           accept="audio/*,.mp3,.wav,.flac,.m4a,.ogg"
           className="hidden"

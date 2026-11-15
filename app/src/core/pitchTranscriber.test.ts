@@ -6,6 +6,9 @@ import {
   planChunks,
 } from './pitchTranscriber';
 import type { NoteEventTime } from '@spotify/basic-pitch';
+import { addPitchBendsToNoteEvents, noteFramesToTime } from '@spotify/basic-pitch';
+import { detectArticulation } from '../profiles/GuitarProfile';
+import { BALANCED_WEIGHTS } from '../profiles/costWeights';
 import type { RawNote } from '../profiles/IInstrumentProfile';
 
 /** NoteEventTime → RawNote 映射（pitchTranscriber 的纯转换层） */
@@ -37,14 +40,14 @@ describe('noteEventsToRawNotes', () => {
     expect(notes[1].velocity).toBe(1);
   });
 
-  it('pitchBends 按包内语义展开：第 i 点 time = start + i*duration/len，cents 原样透传', () => {
+  it('pitchBends 的每 3 bin 转换为 100 cents，采样时间保持不变', () => {
     const notes = noteEventsToRawNotes([
       {
         startTimeSeconds: 2,
         durationSeconds: 1,
         pitchMidi: 60,
         amplitude: 0.5,
-        pitchBends: [-100, 0, 100],
+        pitchBends: [-3, 0, 3],
       },
     ]);
     expect(notes[0].pitchBend).toEqual([
@@ -52,6 +55,27 @@ describe('noteEventsToRawNotes', () => {
       { time: 2 + 1 / 3, cents: 0 },
       { time: 2 + 2 / 3, cents: 100 },
     ]);
+  });
+
+  it('实际 Basic Pitch contour 输出的半音推弦能触发奏法检测', () => {
+    // Basic Pitch 的最低音 A0=21，每半音 3 个 contour bin。
+    const pitch = 60;
+    const center = (pitch - 21) * 3;
+    const contours = [0, 1, 3].map((offset) => {
+      const row = Array<number>(264).fill(0);
+      row[center + offset] = 1;
+      return row;
+    });
+    const events = addPitchBendsToNoteEvents(contours, [{
+      startFrame: 0, durationFrames: 3, pitchMidi: pitch, amplitude: 0.8,
+    }]);
+    expect(events[0].pitchBends).toEqual([0, 1, 3]);
+    const raw = noteEventsToRawNotes(noteFramesToTime(events))[0];
+    expect(raw.pitchBend?.map((p) => p.cents)).toEqual([0, 100 / 3, 100]);
+    const fretted = { ...raw, string: 2, fret: 1, bend: raw.pitchBend };
+    expect(detectArticulation([fretted], {
+      config: {}, style: 'balanced', weights: BALANCED_WEIGHTS,
+    })[0].techniques).toContain('bend');
   });
 
   it('保持事件顺序与空数组输入', () => {
@@ -133,6 +157,22 @@ describe('长曲分段（§3.2：静音切点 + 重叠兜底 + 后处理全局�
       [49, 60],
       [50.5, 62],
     ]);
+  });
+
+  it('mergeChunkNotes：bend 时间平移到全曲坐标，保持输入曲线不变', () => {
+    const source = {
+      ...rn(0.1, 60),
+      pitchBend: [{ time: 0.1, cents: 0 }, { time: 0.3, cents: 100 }],
+    };
+    const merged = mergeChunkNotes([[], [source]], [
+      { start: 0, end: 50, overlapWithPrev: 0 },
+      { start: 50, end: 100, overlapWithPrev: 0 },
+    ]);
+    expect(merged[0].onset).toBeCloseTo(50.1);
+    expect(merged[0].pitchBend).toEqual([
+      { time: 50.1, cents: 0 }, { time: 50.3, cents: 100 },
+    ]);
+    expect(source.pitchBend[1].time).toBe(0.3);
   });
 
   it('mergeChunkNotes：重叠区同音高快速重复音一对一配对（间隔 0.15s 不被误并成一个）', () => {

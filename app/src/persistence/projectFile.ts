@@ -6,11 +6,11 @@
  *   ├── project.json            # 元数据 + 谱引用（本引擎同时内联 alphaTex 便于单文件自检）
  *   ├── transcript/score.alphaTex
  *   ├── editOverlay.json        # 人工修正打标（§2.4，与转写结果分离存储）
- *   ├── source/original.<ext>   # 自包含模式的原音频拷贝
+ *   ├── source/audio-<sha256>.<ext> # 不可变音频版本（旧工程 original.<ext> 兼容）
  *   └── history/snapshots/<时间戳>-<label>.json   # AI 改谱历史，逐版可回滚
  *
  * 设计要点：
- * - JSON 一律 .tmp + move 原子写（writeFileAtomic），中断不留半截文件；
+ * - project.json 是新保存工程的单一提交点，谱面/overlay 文件是派生副本；
  * - project.json 带 schemaVersion，加载走 migrate() 迁移链；
  * - 增量保存：saveProject 只写 project.json + score.alphaTex（音频、快照不动）；
  * - 谱面库（§2.2 library.json 可后置）：listProjects 现读各 project.json 头部即可。
@@ -49,6 +49,8 @@ const NoteSchema = z.object({
   suspectedHarmonic: z.boolean().optional(),
 });
 
+const EMBEDDED_AUDIO_PATH = /^source\/audio-([a-f0-9]{64})\.[a-z0-9]+$/;
+
 const AudioRefSchema = z.object({
   fileName: z.string().optional(),
   durationSec: z.number().optional(),
@@ -56,6 +58,8 @@ const AudioRefSchema = z.object({
   sha256: z.string().optional(),
   storage: z.enum(['linked', 'embedded']),
   linkedPath: z.string().optional(),
+  /** Project-relative immutable content path; absent in legacy projects. */
+  embeddedPath: z.string().regex(EMBEDDED_AUDIO_PATH).optional(),
 });
 
 /**
@@ -72,6 +76,8 @@ const StemsRefSchema = z.object({
 
 export const ProjectManifestSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
+  /** New saves commit all editable content here; absent for legacy projects. */
+  contentAuthority: z.literal('manifest').optional(),
   id: z.string().min(1),
   name: z.string().min(1),
   createdAt: z.string(),
@@ -186,32 +192,51 @@ export type SaveProjectOptions = {
   audioFileName?: string;
 };
 
-/** 增量保存：project.json + transcript/score.alphaTex（+ 首次的音频拷贝） */
+/** Audio versions are staged first; project.json commits their reference with the score. */
 export async function saveProject(
   fs: FsAdapter,
   project: ProjectManifest,
   opts: SaveProjectOptions = {},
 ): Promise<ProjectManifest> {
-  const next: ProjectManifest = { ...project, updatedAt: new Date().toISOString() };
+  const next: ProjectManifest = { ...project, contentAuthority: 'manifest', updatedAt: new Date().toISOString() };
   const root = projectPath(dirOfProject(next));
 
-  if (opts.audioBytes && opts.audioFileName) {
-    const ext = (opts.audioFileName.split('.').pop() ?? 'bin').toLowerCase().replace(/[^a-z0-9]/g, '');
-    await fs.writeFile(joinPath(root, 'source', `original.${ext}`), opts.audioBytes);
+  if ((opts.audioBytes !== undefined) !== (opts.audioFileName !== undefined) ||
+      (opts.audioFileName !== undefined && !opts.audioFileName.trim())) {
+    throw new Error('嵌入音频必须同时提供音频字节和有效文件名');
+  }
+  if (opts.audioBytes !== undefined && opts.audioFileName !== undefined) {
+    const audioBytes = opts.audioBytes.slice();
+    const hash = await sha256Hex(audioBytes);
+    const ext = (opts.audioFileName.split('.').pop() ?? 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+    const embeddedPath = `source/audio-${hash}.${ext}`;
+    const destination = joinPath(root, embeddedPath);
+    if (await fs.exists(destination)) {
+      if (await sha256Hex(await fs.readFile(destination)) !== hash) {
+        throw new ProjectCorruptError(dirOfProject(next), `嵌入音频内容与哈希路径不符：${embeddedPath}`);
+      }
+    } else {
+      await writeFileAtomic(fs, destination, audioBytes);
+    }
     next.audio = {
       ...(next.audio ?? {}),
       fileName: opts.audioFileName,
       storage: 'embedded',
-      sha256: await sha256Hex(opts.audioBytes),
+      sha256: hash,
+      embeddedPath,
     };
   }
 
   await writeFileAtomic(fs, joinPath(root, 'project.json'), jsonToBytes(next));
-  await writeFileAtomic(fs, joinPath(root, 'transcript', 'score.alphaTex'), textToBytes(next.alphaTex));
-  if (next.editOverlay.length > 0) {
-    await writeFileAtomic(fs, joinPath(root, 'editOverlay.json'), jsonToBytes(next.editOverlay));
-  } else {
-    await fs.remove(joinPath(root, 'editOverlay.json'));
+  try {
+    await writeFileAtomic(fs, joinPath(root, 'transcript', 'score.alphaTex'), textToBytes(next.alphaTex));
+    if (next.editOverlay.length > 0) {
+      await writeFileAtomic(fs, joinPath(root, 'editOverlay.json'), jsonToBytes(next.editOverlay));
+    } else {
+      await fs.remove(joinPath(root, 'editOverlay.json'));
+    }
+  } catch (error) {
+    throw new Error(`工程已提交到 project.json，派生副本更新失败：${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
   return next;
 }
@@ -221,18 +246,55 @@ function dirOfProject(project: ProjectManifest): string {
   return projectDirName(project.name, project.id);
 }
 
-/** 重命名 = 目录改名 + project.json 更新 */
+/** Publish a complete renamed copy before removing the original project. */
 export async function renameProject(fs: FsAdapter, project: ProjectManifest, newName: string): Promise<ProjectManifest> {
   const oldDir = projectDirName(project.name, project.id);
-  const next = { ...project, name: newName.trim() || project.name, updatedAt: new Date().toISOString() };
+  const { project: persisted } = await loadProject(fs, oldDir);
+  const next: ProjectManifest = { ...persisted, contentAuthority: 'manifest',
+    name: newName.trim() || persisted.name, updatedAt: new Date().toISOString() };
   const newDir = projectDirName(next.name, next.id);
-  if (oldDir !== newDir) await fs.move(projectPath(oldDir), projectPath(newDir));
+  if (oldDir === newDir) {
+    await writeFileAtomic(fs, joinPath(projectPath(oldDir), 'project.json'), jsonToBytes(next));
+    return next;
+  }
+  if (await fs.exists(projectPath(newDir))) throw new Error(`目标工程目录已存在：${newDir}`);
+  // The staging directory is not an .agtp entry and cannot appear as a
+  // half-renamed project in listProjects. The source remains untouched.
+  const staging = projectPath(`${newDir}.rename-${newProjectId()}.tmp`);
+  try {
+    await copyProjectFiles(fs, projectPath(oldDir), staging);
+    await writeFileAtomic(fs, joinPath(staging, 'project.json'), jsonToBytes(next));
+    await fs.move(staging, projectPath(newDir));
+  } catch (error) {
+    try { await fs.remove(staging); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], `改名失败，原工程仍保留在 ${oldDir}；临时目录清理失败`); }
+    throw error;
+  }
+  try { await fs.remove(projectPath(oldDir)); }
+  catch (error) { throw new Error(`新工程已保存于 ${newDir}，旧工程目录 ${oldDir} 清理失败`, { cause: error }); }
   return next;
+}
+
+async function copyProjectFiles(fs: FsAdapter, from: string, to: string): Promise<void> {
+  const entries = await fs.list(from);
+  if (entries.length === 0) {
+    // FsAdapter has no mkdir; a temporary file creates this empty directory
+    // consistently on all three backends without expanding the interface.
+    const placeholder = joinPath(to, `.rename-empty-${newProjectId()}`);
+    await fs.writeFile(placeholder, new Uint8Array());
+    await fs.remove(placeholder);
+  }
+  for (const entry of entries) {
+    const source = joinPath(from, entry.path);
+    const target = joinPath(to, entry.path);
+    if (entry.dir) await copyProjectFiles(fs, source, target);
+    else await fs.writeFile(target, await fs.readFile(source));
+  }
 }
 export type LoadedProject = {
   project: ProjectManifest;
   dir: string;
-  /** transcript/score.alphaTex 的实际内容（与 project.json 内联值可能短暂不一致时以此为准） */
+  /** Effective score: committed manifest for new saves; standalone file for legacy projects. */
   alphaTexFile: string;
 };
 
@@ -273,9 +335,10 @@ export async function loadProject(fs: FsAdapter, dir: string): Promise<LoadedPro
   const schema = ProjectManifestSchema.safeParse(migrate(parsed));
   if (!schema.success) throw new ProjectCorruptError(dir, schema.error.issues[0]?.message ?? 'schema 不匹配');
 
-  // editOverlay.json 与谱面文件以独立文件为准（Git 友好的增量修改面）
+  // Only legacy projects use standalone content. New saves have a single
+  // commit point, so stale/partially updated mirrors must never be mixed in.
   let editOverlay = schema.data.editOverlay;
-  try {
+  if (schema.data.contentAuthority !== 'manifest') try {
     const overlayRaw = await fs.readFile(joinPath(root, 'editOverlay.json'));
     editOverlay = z.array(EditEntrySchema).parse(JSON.parse(bytesToText(overlayRaw)));
   } catch (e) {
@@ -286,7 +349,7 @@ export async function loadProject(fs: FsAdapter, dir: string): Promise<LoadedPro
   }
 
   let alphaTexFile = schema.data.alphaTex;
-  try {
+  if (schema.data.contentAuthority !== 'manifest') try {
     alphaTexFile = bytesToText(await fs.readFile(joinPath(root, 'transcript', 'score.alphaTex')));
   } catch {
     // 谱面文件缺失 → 退回 manifest 内联副本
@@ -390,8 +453,24 @@ export async function latestSnapshot(fs: FsAdapter, dir: string): Promise<AiSnap
 /** 读自包含模式下的原音频字节 */
 export async function readEmbeddedAudio(fs: FsAdapter, dir: string, audio: AudioRef): Promise<Uint8Array | null> {
   if (audio.storage !== 'embedded') return null;
+  if (audio.embeddedPath !== undefined) {
+    const match = EMBEDDED_AUDIO_PATH.exec(audio.embeddedPath);
+    if (!match) throw new ProjectCorruptError(dir, '非法嵌入音频引用路径');
+    const data = await fs.readFile(joinPath(projectPath(dir), audio.embeddedPath));
+    const hash = await sha256Hex(data);
+    if (hash !== match[1] || (audio.sha256 !== undefined && hash !== audio.sha256)) {
+      throw new ProjectCorruptError(dir, '嵌入音频哈希校验失败');
+    }
+    return data;
+  }
+  // Legacy references have no explicit path. If a hash is present, identify
+  // the matching original rather than choosing an unrelated extension.
   const files = await fs.list(joinPath(projectPath(dir), 'source'));
-  const original = files.find((f) => f.path.startsWith('original.'));
-  if (!original) return null;
-  return fs.readFile(joinPath(projectPath(dir), 'source', original.path));
+  const originals = files.filter((f) => !f.dir && /^original\.[a-z0-9]+$/i.test(f.path));
+  for (const original of originals) {
+    const data = await fs.readFile(joinPath(projectPath(dir), 'source', original.path));
+    if (audio.sha256 === undefined || await sha256Hex(data) === audio.sha256) return data;
+  }
+  if (originals.length && audio.sha256 !== undefined) throw new ProjectCorruptError(dir, '旧版嵌入音频哈希校验失败');
+  return null;
 }

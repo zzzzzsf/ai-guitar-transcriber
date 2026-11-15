@@ -6,6 +6,8 @@
  * - AI 改谱必须保留 \tempo 标记与分段（v4.1 §3.5 BYOK 约束）。
  */
 
+import { countScoreBars } from '../core/scoreContext';
+
 /** 谱面文本塞进 prompt 的上限 —— 4 分钟谱约 2~3k token，超长曲截断并提示 */
 export const PROMPT_TEX_LIMIT = 12_000;
 
@@ -33,7 +35,7 @@ export const CHORD_SYSTEM_PROMPT = `你是一名资深吉他乐理编辑，任�
 export function buildChordUserPrompt(alphaTex: string, barCount: number, key?: string): string {
   const keyLine = key ? `参考调性：${key}（可能与实际出入，仅作提示）。` : '调性未知，自行判断。';
   return `下面是一首吉他曲的 alphaTex 六线谱（共 ${barCount} 小节）。${keyLine}
-谱面中 ":时值 弦.品" 是音符，"|" 分隔小节，"\\tempo" 是速度标记。
+谱面中 ":时值 品.弦" 是音符（例如 3.2 表示第 2 弦第 3 品，弦号从高音弦 1 开始），"|" 分隔小节，"\\tempo" 是速度标记。
 
 ${clampTexForPrompt(alphaTex)}
 
@@ -46,10 +48,10 @@ export const REWRITE_SYSTEM_PROMPT = `你是一名吉他编配专家。用户会
 
 规则（必须严格遵守）：
 1. 只输出 alphaTex 文本本身，不要解释、不要代码块围栏。
-2. 语法保持不变：":时值 弦.品" 音符、"{效果}" 标注、"| \\tempo 速度" 等元命令原样保留。
+2. 语法保持不变：":时值 品.弦" 音符（如 3.2 为第 2 弦第 3 品）、"{效果}" 标注、"| \\tempo 速度" 等元命令原样保留。
 3. "\\tempo" 速度标记与分段结构一律不得删除、不得修改、不得新增（变速信息来自音频检测，是硬约束）。
 4. 小节数量保持不变（除非用户要求增删小节）。
-5. 改编只作用于音符的弦.品选择、时值简化、技巧标注，音高序列除非用户明确要求否则不改。
+5. 改编只作用于音符的品.弦选择、时值简化、技巧标注，音高序列除非用户明确要求否则不改。
 6. 改完自查一遍语法可解析（括号/竖线配对、音符格式完整）。`;
 
 export function buildRewriteUserPrompt(alphaTex: string, instruction: string, context?: string): string {
@@ -72,9 +74,10 @@ export const SPLIT_SYSTEM_PROMPT = `你是一名吉他编配专家。用户给�
 - "\\tempo" 标记两轨都要保留（播放时同步）。`;
 
 export function buildSplitUserPrompt(alphaTex: string): string {
-  return `原谱（单轨 alphaTex，${alphaTex.split('|').length - 1} 小节）：
+  const barCount = countScoreBars(alphaTex);
+  return `原谱（单轨 alphaTex，${barCount} 小节；音符格式为品.弦，例如 3.2 表示第 2 弦第 3 品）：
 
-${clampTexForPrompt(alphaTex)}
+${alphaTex}
 
 请拆分为 Lead 与 Rhythm 双轨，按输出契约返回 JSON。`;
 }

@@ -72,7 +72,7 @@ export async function downloadModel(opts: DownloadModelOpts): Promise<DownloadRe
   for (const source of opts.sources) {
     for (let attempt = 0; attempt <= fullRetries; attempt += 1) {
       try {
-        return await downloadFromSource(source, attempt, { ...opts, fetchImpl, flushThreshold });
+        return await downloadFromSource(source, { ...opts, fetchImpl, flushThreshold });
       } catch (e) {
         if (opts.signal?.aborted || (e as Error).name === 'AbortError') {
           throw new ModelDownloadError('下载已取消', failures);
@@ -80,7 +80,7 @@ export async function downloadModel(opts: DownloadModelOpts): Promise<DownloadRe
         const reason = e instanceof Error ? e.message : String(e);
         failures.push({ source: source.label ?? source.url, reason });
         if (e instanceof PermanentDownloadError) break; // 4xx：同源重试无意义，换源
-        // 校验失败/瞬时错误已在本源内部从零重试过；此处换下一个源
+        // 校验失败已经删去坏断点；一般网络错误保留已落盘前缀用于重试。
       }
     }
   }
@@ -92,18 +92,15 @@ export async function downloadModel(opts: DownloadModelOpts): Promise<DownloadRe
 
 async function downloadFromSource(
   source: DownloadSource,
-  attempt: number,
   opts: DownloadModelOpts & { fetchImpl: typeof fetch; flushThreshold: number },
 ): Promise<DownloadResult> {
   const partPath = joinPath(opts.destDir, `${opts.fileName}.part`);
   const finalPath = joinPath(opts.destDir, opts.fileName);
 
-  // 校验失败重下（attempt > 0）时从零开始，否则保留可续传的 .part
+  // 是否可续传取决于断点本身，而非重试次数。坏 hash/Range 会主动删除它。
   let prefix: Uint8Array = new Uint8Array(0);
-  if (attempt === 0 && (await opts.fs.exists(partPath))) {
+  if (await opts.fs.exists(partPath)) {
     prefix = await opts.fs.readFile(partPath);
-  } else {
-    await opts.fs.remove(partPath);
   }
 
   const resp = await opts.fetchImpl(source.url, {
@@ -112,13 +109,31 @@ async function downloadFromSource(
   });
 
   let start = 0;
-  if (resp.status === 206 && prefix.length > 0) {
-    start = prefix.length; // 续传命中
-  } else if (resp.status === 200 || resp.status === 206) {
+  let rangeTotal: number | undefined;
+  let rangeEnd: number | undefined;
+  if (resp.status === 206) {
+    const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(resp.headers.get('content-range') ?? '');
+    const first = Number(range?.[1]);
+    const last = Number(range?.[2]);
+    const total = Number(range?.[3]);
+    if (!range || ![first, last, total].every(Number.isSafeInteger) ||
+        first !== prefix.length || last < first || total <= last) {
+      await opts.fs.remove(partPath);
+      throw new Error('Content-Range 无效或与下载断点不一致');
+    }
+    start = prefix.length;
+    rangeTotal = total;
+    rangeEnd = last;
+  } else if (resp.status === 200) {
     start = 0; // 服务端不支持 Range → 整包重下
     prefix = new Uint8Array(0);
   } else if (resp.status === 416 && prefix.length > 0) {
     // 范围越界：.part 已是全量（上次中断在收尾）→ 无 body 续接，直接校验
+    const total = /^bytes \*\/(\d+)$/.exec(resp.headers.get('content-range') ?? '');
+    if ((total && Number(total[1]) !== prefix.length) || (!total && !opts.expectedSha256)) {
+      await opts.fs.remove(partPath);
+      throw new Error('HTTP 416 不能证明当前断点是完整模型');
+    }
     const sha = await sha256Hex(prefix);
     return finalize(opts, partPath, finalPath, prefix, sha, prefix.length);
   } else {
@@ -128,7 +143,8 @@ async function downloadFromSource(
   }
 
   const contentLength = Number(resp.headers.get('content-length') ?? '');
-  const totalBytes = Number.isFinite(contentLength) && contentLength > 0 ? start + contentLength : undefined;
+  const totalBytes = rangeTotal ??
+    (Number.isFinite(contentLength) && contentLength > 0 ? start + contentLength : undefined);
 
   // 流式读取：prefix + 增量 chunk，按阈值落盘 .part（断网后可从上次落盘点续传）
   const chunks: Uint8Array[] = [];
@@ -166,11 +182,15 @@ async function downloadFromSource(
 
   // flush 不变式：所有字节（续传前缀 + 增量）此时都已在 prefix 里
   const full = prefix;
-  const sha = await sha256Hex(full);
-  if (opts.expectedSha256 && sha.toLowerCase() !== opts.expectedSha256.toLowerCase()) {
-    await opts.fs.remove(partPath); // 校验失败：删 .part，调用方/重试循环从零再来
-    throw new Error(`SHA-256 校验失败（期望 ${opts.expectedSha256.slice(0, 12)}…，实际 ${sha.slice(0, 12)}…）`);
+  if (rangeEnd !== undefined && full.length !== rangeEnd + 1) {
+    if (full.length > rangeEnd + 1) await opts.fs.remove(partPath);
+    throw new Error('下载字节数不完整或与 Content-Range 声明不一致');
   }
+  if (totalBytes !== undefined && full.length !== totalBytes) {
+    if (full.length > totalBytes) await opts.fs.remove(partPath);
+    throw new Error(`下载字节数不完整（期望 ${totalBytes}，实际 ${full.length}）`);
+  }
+  const sha = await sha256Hex(full);
   return finalize(opts, partPath, finalPath, full, sha, start);
 }
 
@@ -182,6 +202,11 @@ async function finalize(
   sha: string,
   resumedBytes: number,
 ): Promise<DownloadResult> {
+  // 所有成功出口统一校验，包括 416 的已下载断点，校验前不能转正模型。
+  if (opts.expectedSha256 && sha.toLowerCase() !== opts.expectedSha256.toLowerCase()) {
+    await opts.fs.remove(partPath);
+    throw new Error(`SHA-256 校验失败（期望 ${opts.expectedSha256.slice(0, 12)}…，实际 ${sha.slice(0, 12)}…）`);
+  }
   await opts.fs.writeFile(partPath, full); // 416 直达路径可能未落盘
   await opts.fs.move(partPath, finalPath);
   return { path: finalPath, bytes: full.length, sha256: sha, resumedBytes };

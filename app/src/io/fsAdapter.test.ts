@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   basename,
   dirname,
@@ -7,6 +7,7 @@ import {
   MemoryFsAdapter,
   NodeFsAdapter,
   FsNotFoundError,
+  FsPathError,
   OpfsFsAdapter,
   sha256Hex,
   textToBytes,
@@ -98,10 +99,133 @@ describe('NodeFsAdapter（真实临时目录）', () => {
   });
 });
 
+describe('NodeFsAdapter 真实链接隔离（全部位于同一个临时夹具）', () => {
+  it('symlink/junction 指向夹具内 root 外的兄弟目录时，各入口均拒绝', async (context) => {
+    const fsp = await import('node:fs/promises');
+    const path = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const temporaryBase = path.resolve(tmpdir());
+    const fixture = await fsp.mkdtemp(path.join(temporaryBase, 'agtp-boundary-'));
+    const root = path.join(fixture, 'root');
+    const outside = path.join(fixture, 'outside');
+    try {
+      await fsp.mkdir(root);
+      await fsp.mkdir(outside);
+      await fsp.writeFile(path.join(outside, 'keep.txt'), 'unchanged');
+      try {
+        await fsp.symlink(outside, path.join(root, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        if (code === 'EPERM' || code === 'EACCES' || code === 'ENOSYS') {
+          context.skip(`当前系统无法创建链接：${code}；此真实链接测试未覆盖`);
+        }
+        throw error;
+      }
+      const fs = await NodeFsAdapter.create(root);
+      await fs.writeFile('inside.txt', textToBytes('inside'));
+      for (const operation of [
+        () => fs.readFile('link/keep.txt'), () => fs.writeFile('link/keep.txt', textToBytes('bad')),
+        () => fs.remove('link/keep.txt'), () => fs.list('link'), () => fs.exists('link/keep.txt'),
+        () => fs.move('link/keep.txt', 'moved.txt'), () => fs.move('inside.txt', 'link/moved.txt'),
+      ]) await expect(operation()).rejects.toBeInstanceOf(FsPathError);
+      expect(await fsp.readFile(path.join(outside, 'keep.txt'), 'utf8')).toBe('unchanged');
+      expect(bytesToText(await fs.readFile('inside.txt'))).toBe('inside');
+    } finally {
+      // Only delete the exact directory returned by mkdtemp, under tmpdir.
+      if (path.dirname(path.resolve(fixture)) !== temporaryBase) throw new Error('Unexpected fixture path');
+      await fsp.rm(fixture, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('NodeFsAdapter 根路径隔离（仅注入 fs，不访问外部文件）', () => {
+  async function fixture() {
+    const path = await import('node:path');
+    const root = path.resolve('virtual-adapter-root');
+    const api = {
+      lstat: vi.fn(async (_path: string) => ({ isSymbolicLink: (): boolean => false })),
+      realpath: vi.fn(async (value: string) => value),
+      readFile: vi.fn(async () => textToBytes('inside')),
+      writeFile: vi.fn(async () => {}),
+      mkdir: vi.fn(async () => {}),
+      rm: vi.fn(async () => {}),
+      rename: vi.fn(async () => {}),
+      stat: vi.fn(async () => ({ size: 6 })),
+      readdir: vi.fn(async () => []),
+    };
+    const fs = new NodeFsAdapter(root, api as unknown as typeof import('node:fs/promises'), path);
+    return { fs, api, root, path };
+  }
+
+  it.each(['../outside', 'safe/../../outside', '..\\outside', '/absolute', '\\rooted',
+    'C:\\absolute', 'C:drive-relative', '\\\\server\\share\\x', '\\\\?\\C:\\x',
+    'file:stream', 'dir/.. /outside', 'file\0name'])('所有入口拒绝路径 %s，且不发出任何 fs 调用', async (bad) => {
+    const { fs, api } = await fixture();
+    for (const operation of [
+      () => fs.readFile(bad), () => fs.writeFile(bad, textToBytes('x')),
+      () => fs.exists(bad), () => fs.list(bad), () => fs.remove(bad),
+      () => fs.move(bad, 'valid'), () => fs.move('valid', bad),
+    ]) await expect(operation()).rejects.toBeInstanceOf(FsPathError);
+    for (const call of Object.values(api)) expect(call).not.toHaveBeenCalled();
+  });
+
+  it('绝对路径即使指向 root 内也拒绝；禁止删除/移动 root 本身', async () => {
+    const { fs, root, path, api } = await fixture();
+    await expect(fs.readFile(path.join(root, 'inside'))).rejects.toBeInstanceOf(FsPathError);
+    await expect(fs.remove('')).rejects.toBeInstanceOf(FsPathError);
+    await expect(fs.remove('.')).rejects.toBeInstanceOf(FsPathError);
+    await expect(fs.move('.', 'renamed-root')).rejects.toBeInstanceOf(FsPathError);
+    expect(api.rm).not.toHaveBeenCalled();
+    expect(api.rename).not.toHaveBeenCalled();
+  });
+
+  it('有效相对路径正常工作，正反斜杠都映射到同一根目录', async () => {
+    const { fs, root, path, api } = await fixture();
+    await fs.writeFile('./dir/file', textToBytes('data'));
+    await fs.readFile('dir\\file');
+    expect(api.writeFile).toHaveBeenCalledWith(path.join(root, 'dir', 'file'), textToBytes('data'));
+    expect(api.readFile).toHaveBeenCalledWith(path.join(root, 'dir', 'file'));
+    expect(await fs.list('')).toEqual([]);
+  });
+
+  it.each(['symlink', 'realpath'])('已有父目录 %s 越界：读写、move 两端、remove 均拒绝', async (mode) => {
+    const { fs, root, path, api } = await fixture();
+    const link = path.join(root, 'link');
+    if (mode === 'symlink') api.lstat.mockImplementation(async (value) => ({ isSymbolicLink: () => value === link }));
+    else api.realpath.mockImplementation(async (value) => value === link ? path.resolve(root, '../outside-fixture') : value);
+    for (const operation of [
+      () => fs.readFile('link/file'), () => fs.writeFile('link/file', textToBytes('x')),
+      () => fs.remove('link/file'), () => fs.exists('link/file'), () => fs.list('link'),
+      () => fs.move('link/file', 'safe'), () => fs.move('safe', 'link/file'),
+    ]) await expect(operation()).rejects.toBeInstanceOf(FsPathError);
+    for (const call of [api.readFile, api.writeFile, api.rm, api.mkdir, api.rename, api.readdir]) {
+      expect(call).not.toHaveBeenCalled();
+    }
+  });
+
+  it('祖先目录被替换为链接后拒绝访问，不把外部物理根重新当合法根', async () => {
+    const { fs, path, api } = await fixture();
+    const ancestor = path.dirname(path.resolve('virtual-adapter-root'));
+    api.lstat.mockImplementation(async (value) => ({
+      isSymbolicLink: () => value === ancestor,
+    }));
+    for (const operation of [
+      () => fs.readFile('inside'), () => fs.writeFile('inside', textToBytes('x')),
+      () => fs.exists('inside'), () => fs.list(''), () => fs.remove('inside'),
+      () => fs.move('inside', 'safe'),
+    ]) await expect(operation()).rejects.toBeInstanceOf(FsPathError);
+    for (const call of [api.readFile, api.writeFile, api.rm, api.rename, api.readdir]) {
+      expect(call).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe('OpfsFsAdapter（node 下用内存 fake handle 测逻辑分支）', () => {
+  type Faults = { onWrite?: (path: string) => void; onClose?: (path: string) => void;
+    onCreateDir?: (path: string) => void; onRemove?: (path: string) => void };
   class FakeFileHandle {
     readonly kind = 'file' as const;
-    constructor(public name: string, public data: Uint8Array) {}
+    constructor(public name: string, public data: Uint8Array, private path = name, private faults: Faults = {}) {}
     async getFile(): Promise<File> {
       const data = this.data;
       return { size: data.length, arrayBuffer: async () => data.slice().buffer } as unknown as File;
@@ -109,8 +233,12 @@ describe('OpfsFsAdapter（node 下用内存 fake handle 测逻辑分支）', () 
     async createWritable(): Promise<FileSystemWritableFileStream> {
       const chunks: Uint8Array[] = [];
       return {
-        write: async (chunk: ArrayBuffer) => chunks.push(new Uint8Array(chunk)),
+        write: async (chunk: ArrayBuffer) => {
+          this.faults.onWrite?.(this.path);
+          chunks.push(new Uint8Array(chunk));
+        },
         close: async () => {
+          this.faults.onClose?.(this.path);
           const total = chunks.reduce((n, c) => n + c.length, 0);
           const out = new Uint8Array(total);
           let off = 0;
@@ -130,26 +258,34 @@ describe('OpfsFsAdapter（node 下用内存 fake handle 测逻辑分支）', () 
       public name: string,
       public files = new Map<string, FakeFileHandle>(),
       public dirs = new Map<string, FakeDirHandle>(),
+      private path = '',
+      public faults: Faults = {},
     ) {}
     async getDirectoryHandle(name: string, opts?: { create?: boolean }): Promise<FileSystemDirectoryHandle> {
+      if (this.files.has(name)) throw new DOMException('Is a file', 'TypeMismatchError');
       let d = this.dirs.get(name);
       if (!d) {
-        if (!opts?.create) throw new Error('NotFoundError');
-        d = new FakeDirHandle(name);
+        if (!opts?.create) throw new DOMException('Missing directory', 'NotFoundError');
+        const path = this.path ? `${this.path}/${name}` : name;
+        this.faults.onCreateDir?.(path);
+        d = new FakeDirHandle(name, new Map(), new Map(), path, this.faults);
         this.dirs.set(name, d);
       }
       return d as unknown as FileSystemDirectoryHandle;
     }
     async getFileHandle(name: string, opts?: { create?: boolean }): Promise<FileSystemFileHandle> {
+      if (this.dirs.has(name)) throw new DOMException('Is a directory', 'TypeMismatchError');
       let f = this.files.get(name);
       if (!f) {
-        if (!opts?.create) throw new Error('NotFoundError');
-        f = new FakeFileHandle(name, new Uint8Array(0));
+        if (!opts?.create) throw new DOMException('Missing file', 'NotFoundError');
+        f = new FakeFileHandle(name, new Uint8Array(0), this.path ? `${this.path}/${name}` : name, this.faults);
         this.files.set(name, f);
       }
       return f as unknown as FileSystemFileHandle;
     }
     async removeEntry(name: string): Promise<void> {
+      this.faults.onRemove?.(this.path ? `${this.path}/${name}` : name);
+      if (!this.files.has(name) && !this.dirs.has(name)) throw new DOMException('Missing entry', 'NotFoundError');
       this.files.delete(name);
       this.dirs.delete(name);
     }
@@ -207,6 +343,70 @@ describe('OpfsFsAdapter（node 下用内存 fake handle 测逻辑分支）', () 
     await writeFileAtomic(fs, 'p/c.json', jsonToBytes({ ok: true }));
     expect(await fs.exists('p/c.json')).toBe(true);
     expect(await fs.exists('p/c.json.tmp')).toBe(false);
+  });
+
+  it('目录 move 保留完整工程、多层内容及空目录，成功后才删除源', async () => {
+    const root = new FakeDirHandle('root');
+    const fs = OpfsFsAdapter.fromRoot(root as unknown as FileSystemDirectoryHandle);
+    await fs.writeFile('source/project.json', textToBytes('manifest'));
+    await fs.writeFile('source/transcript/score.alphaTex', textToBytes('score'));
+    await fs.writeFile('source/history/deep/snapshot.json', textToBytes('history'));
+    const source = await root.getDirectoryHandle('source');
+    await source.getDirectoryHandle('empty', { create: true });
+    let removedSource = false;
+    root.faults.onRemove = (path) => {
+      if (path === 'source') {
+        const dest = root.dirs.get('destination')!;
+        expect(dest.files.get('project.json')?.data).toEqual(textToBytes('manifest'));
+        expect(dest.dirs.get('transcript')?.files.get('score.alphaTex')?.data).toEqual(textToBytes('score'));
+        expect(dest.dirs.get('empty')).toBeDefined();
+        removedSource = true;
+      }
+    };
+    await fs.move('source', 'destination');
+    expect(removedSource).toBe(true);
+    expect(await fs.exists('source')).toBe(false);
+    expect(bytesToText(await fs.readFile('destination/history/deep/snapshot.json'))).toBe('history');
+  });
+
+  it.each(['write', 'close', 'directory'])('目录复制 %s 失败不会删除源，清理仅限新目标', async (phase) => {
+    const root = new FakeDirHandle('root');
+    const fs = OpfsFsAdapter.fromRoot(root as unknown as FileSystemDirectoryHandle);
+    await fs.writeFile('source/a.json', textToBytes('a'));
+    await fs.writeFile('source/sub/score.alphaTex', textToBytes('score'));
+    await fs.writeFile('unrelated/keep', textToBytes('keep'));
+    const fail = (path: string) => {
+      if (path.startsWith('destination/sub')) throw new Error(`injected ${phase}`);
+    };
+    if (phase === 'write') root.faults.onWrite = fail;
+    else if (phase === 'close') root.faults.onClose = fail;
+    else root.faults.onCreateDir = fail;
+    await expect(fs.move('source', 'destination')).rejects.toThrow(`injected ${phase}`);
+    expect(bytesToText(await fs.readFile('source/a.json'))).toBe('a');
+    expect(bytesToText(await fs.readFile('source/sub/score.alphaTex'))).toBe('score');
+    expect(bytesToText(await fs.readFile('unrelated/keep'))).toBe('keep');
+    expect(await fs.exists('destination')).toBe(false);
+  });
+
+  it('目标已有目录时拒绝合并，同路径移动保持内容；拒绝子目录迁移', async () => {
+    const fs = makeFs();
+    await fs.writeFile('source/project.json', textToBytes('source'));
+    await fs.writeFile('destination/project.json', textToBytes('destination'));
+    await expect(fs.move('source', 'destination')).rejects.toThrow('已存在');
+    await expect(fs.move('source', 'source/child')).rejects.toBeInstanceOf(FsPathError);
+    await fs.move('source/project.json', 'source/project.json');
+    expect(bytesToText(await fs.readFile('source/project.json'))).toBe('source');
+    expect(bytesToText(await fs.readFile('destination/project.json'))).toBe('destination');
+  });
+
+  it('源目录删除失败时保留已经完成的目标副本', async () => {
+    const root = new FakeDirHandle('root');
+    const fs = OpfsFsAdapter.fromRoot(root as unknown as FileSystemDirectoryHandle);
+    await fs.writeFile('source/project.json', textToBytes('manifest'));
+    root.faults.onRemove = (path) => { if (path === 'source') throw new Error('source busy'); };
+    await expect(fs.move('source', 'destination')).rejects.toThrow('source busy');
+    expect(bytesToText(await fs.readFile('source/project.json'))).toBe('manifest');
+    expect(bytesToText(await fs.readFile('destination/project.json'))).toBe('manifest');
   });
 });
 

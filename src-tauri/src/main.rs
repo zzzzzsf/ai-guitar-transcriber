@@ -9,6 +9,7 @@ mod diagnostics;
 mod download;
 mod logging;
 mod native;
+mod separation;
 mod updater;
 
 use std::fs;
@@ -71,6 +72,9 @@ fn main() {
             commands::llm_fetch,
             commands::sidecar_run,
             commands::sidecar_cancel,
+            separation::separator_available,
+            separation::separation_run,
+            separation::cancel_separation,
             commands::download_model,
             // 壳侧辅助
             commands::taskbar_progress,

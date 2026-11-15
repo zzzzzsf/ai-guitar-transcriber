@@ -112,3 +112,9 @@ pub(crate) fn file_sha256(path: &Path) -> std::io::Result<[u8; 32]> {
     }
     Ok(hasher.finalize().into())
 }
+
+pub(crate) fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}

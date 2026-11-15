@@ -64,7 +64,7 @@ export default function TempoMapPanel({
           <button
             onClick={onUndoAuto}
             disabled={busy}
-            title="撤销自动应用，恢复恒定 BPM"
+            title="撤销这次应用，恢复之前的变速分段"
             className="shrink-0 rounded-md border border-white/10 px-1.5 py-0.5 text-[10px] text-zinc-400 transition-colors hover:text-zinc-200 disabled:opacity-40"
           >
             撤销
@@ -178,7 +178,7 @@ export default function TempoMapPanel({
           <button
             onClick={onReset}
             disabled={busy}
-            title="恢复全曲恒定 BPM"
+            title="重新检测 BPM；演示曲恢复初始速度"
             className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2 py-1.5 text-[11px] text-zinc-400 transition-colors hover:text-zinc-200 disabled:opacity-40"
           >
             <RotateCcw className="h-3 w-3" />

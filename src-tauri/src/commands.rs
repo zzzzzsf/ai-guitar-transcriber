@@ -271,7 +271,7 @@ pub fn sidecar_cancel(run_id: u64) -> Result<(), String> {
 }
 
 /// Windows 杀进程树：taskkill /T /F 语义（§6.3——否则孙进程残留占着模型内存）
-fn kill_process_tree(pid: u32) -> Result<(), String> {
+pub(crate) fn kill_process_tree(pid: u32) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new("taskkill")
@@ -289,7 +289,7 @@ fn kill_process_tree(pid: u32) -> Result<(), String> {
 
 /// 防休眠（§6.3 可选项）：一次性 ES_SYSTEM_REQUIRED 重置空闲计时器即可，
 /// 不用 ES_CONTINUOUS（async 任务会在线程间跳，线程持续标志位不可靠）。
-fn keep_awake_tick() {
+pub(crate) fn keep_awake_tick() {
     const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
     unsafe { windows_sys::Win32::System::Power::SetThreadExecutionState(ES_SYSTEM_REQUIRED) };
 }
@@ -325,7 +325,7 @@ fn parse_percent(text: &str) -> Option<f64> {
     (0.0..=100.0).contains(&n).then_some(n)
 }
 
-fn set_taskbar(w: &tauri::WebviewWindow, progress: Option<f64>) {
+pub(crate) fn set_taskbar(w: &tauri::WebviewWindow, progress: Option<f64>) {
     use tauri::window::{ProgressBarState, ProgressBarStatus};
     let state = match progress {
         Some(p) => ProgressBarState {
@@ -372,6 +372,12 @@ pub async fn download_model(
     spec: ModelSpec,
     on_progress: Channel<serde_json::Value>,
 ) -> Result<String, String> {
+    if spec.name.is_empty() ||
+        spec.name.contains('\\') || spec.name.contains('/') ||
+        spec.name == "." || spec.name == ".." ||
+        spec.name.contains('\0') {
+      return Err("模型文件名必须是 models 目录内的单个文件名".into());
+    }
     let models_dir = local_data_dir().join("models");
     std::fs::create_dir_all(&models_dir).map_err(|e| e.to_string())?;
     let final_path = models_dir.join(&spec.name);
@@ -424,6 +430,15 @@ pub fn diagnostics_export(app: AppHandle) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_name_cannot_escape_models_dir() {
+      let bad = ["../evil", "a/b", "a\\b", "..", ".", "", "file\0name"];
+      for name in bad {
+        assert!(name.contains('/') || name.contains('\\') ||
+          name == ".." || name == "." || name.is_empty() || name.contains('\0'));
+      }
+    }
 
     #[test]
     fn parse_percent_integer() {

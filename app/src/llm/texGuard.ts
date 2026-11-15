@@ -40,6 +40,19 @@ export function extractKeySignatures(tex: string): string[] {
 }
 
 function countNotes(tex: string): number {
+  try {
+    let count = 0;
+    for (const track of readScore(tex).tracks) {
+      for (const staff of track.staves) {
+        for (const bar of staff.bars) {
+          for (const voice of bar.voices) {
+            for (const beat of voice.beats) count += beat.notes.filter((n) => !n.isTieDestination).length;
+          }
+        }
+      }
+    }
+    return count;
+  } catch { /* 无法解析时仍为错误预览提供近似统计。 */ }
   // 先剥掉 \tempo 120.5 / \ks 之类元命令，防其小数被当音符记号
   const body = tex.replace(/\\[a-z]+\s+([^\s|]+)/gi, '');
   // 音符记号 "弦.品"（本工程导出格式 "fret.string"，通用场景兼容 "string.fret"）
@@ -59,10 +72,37 @@ export type BarDiff = {
   removedBars: number;
 };
 
-/** 小节级 diff：按 "|" 切分逐小节对比，输出变更小节号（1 基）与增删量 */
+function barFingerprints(tex: string): string[] | null {
+  try {
+    const score = readScore(tex);
+    return score.masterBars.map((master, index) => JSON.stringify({
+      signature: [master.timeSignatureNumerator, master.timeSignatureDenominator],
+      tempo: master.tempoAutomations.map((a) => [a.value, a.ratioPosition, a.isLinear]),
+      tracks: score.tracks.map((track) => track.staves.map((staff) => {
+        const bar = staff.bars[index];
+        return bar ? {
+          key: [bar.keySignature, bar.keySignatureType],
+          voices: bar.voices.map((voice) => voice.beats.map((beat) => ({
+            start: beat.playbackStart, duration: beat.playbackDuration,
+            notes: beat.notes.map((note) => JSON.stringify({
+              string: note.string, fret: note.fret, pitch: note.realValue,
+              tie: note.isTieDestination, palmMute: note.isPalmMute,
+              hammerPull: note.isHammerPullOrigin, slide: note.slideOutType,
+              bend: note.bendPoints?.map((point) => [point.offset, point.value]),
+            })).sort(),
+          }))),
+        } : null;
+      })),
+    }));
+  } catch { return null; }
+}
+
+/** 按共享小节时间轴比较各声部，输出变更小节号（1 基）与增删量。 */
 export function diffBars(before: string, after: string): BarDiff {
-  const a = splitBars(before);
-  const b = splitBars(after);
+  const parsedBefore = barFingerprints(before);
+  const parsedAfter = barFingerprints(after);
+  const a = parsedBefore && parsedAfter ? parsedBefore : splitBars(before);
+  const b = parsedBefore && parsedAfter ? parsedAfter : splitBars(after);
   const changedBars: number[] = [];
   const common = Math.min(a.length, b.length);
   for (let i = 0; i < common; i++) {
@@ -75,16 +115,89 @@ export function diffBars(before: string, after: string): BarDiff {
   };
 }
 
-/** \tempo 序列 before 必须是 after 的保序子序列（允许新增，不允许删改） */
-function droppedTempoMarkers(before: number[], after: number[]): number[] {
-  let j = 0;
-  const dropped: number[] = [];
-  for (const t of before) {
-    while (j < after.length && after[j] !== t) j += 1;
-    if (j >= after.length) dropped.push(t);
-    else j += 1;
-  }
-  return dropped;
+/** Reposition preserves notes; arrangement permits note edits, e.g. split tracks. */
+export type TexEditPolicy = 'reposition' | 'arrange';
+
+function readScore(tex: string): alphaTab.model.Score {
+  if (!tex.trim()) throw new Error('alphaTex 为空');
+  const importer = new alphaTab.importer.AlphaTexImporter();
+  importer.initFromString(tex, new alphaTab.Settings());
+  return importer.readScore();
+}
+
+function semantics(score: alphaTab.model.Score) {
+  return {
+    tempo: {
+      initial: score.tempo,
+      points: score.masterBars.flatMap((bar) =>
+        bar.tempoAutomations.map((a) => ({
+          bar: bar.index,
+          // Compare a musical location, not the order of BPM numbers in text.
+          tick: Math.round(a.ratioPosition * bar.calculateDuration() * 1e6) / 1e6,
+          bpm: a.value,
+          linear: a.isLinear,
+          visible: a.isVisible,
+        })),
+      ),
+    },
+    structure: score.masterBars.map((bar) => ({
+      timeSignature: [bar.timeSignatureNumerator, bar.timeSignatureDenominator],
+      duration: bar.calculateDuration(),
+      pickup: bar.isAnacrusis,
+      freeTime: bar.isFreeTime,
+      repeatStart: bar.isRepeatStart,
+      repeatCount: bar.repeatCount,
+      alternateEndings: bar.alternateEndings,
+      tripletFeel: bar.tripletFeel,
+      directions: [...(bar.directions ?? [])].sort(),
+    })),
+    instruments: score.tracks.map((track) =>
+      track.staves.map((staff) => ({
+        tuning: staff.stringTuning.tunings,
+        capo: staff.capo,
+        transposition: staff.transpositionPitch,
+        displayTransposition: staff.displayTranspositionPitch,
+        mute: track.playbackInfo.isMute,
+        solo: track.playbackInfo.isSolo,
+      })),
+    ),
+    keys: score.tracks.map((track) =>
+      track.staves.map((staff) =>
+        staff.bars.map((bar) => [bar.keySignature, bar.keySignatureType]),
+      ),
+    ),
+    music: score.tracks.map((track) =>
+      track.staves.map((staff) =>
+        staff.bars.map((bar) =>
+          bar.voices.map((voice) =>
+            voice.beats.map((beat) => ({
+              start: beat.playbackStart,
+              duration: beat.playbackDuration,
+              grace: beat.graceType,
+              notes: beat.notes.map((note) => JSON.stringify({
+                pitch: note.realValue,
+                tie: note.isTieDestination,
+                dead: note.isDead,
+                ghost: note.isGhost,
+                staccato: note.isStaccato,
+                palmMute: note.isPalmMute,
+                letRing: note.isLetRing,
+                harmonic: [note.harmonicType, note.harmonicValue],
+                bend: note.bendPoints?.map((p) => [p.offset, p.value]) ?? [],
+                trill: note.isTrill ? note.trillValue : null,
+                hammerPull: note.isHammerPullOrigin,
+                slide: note.slideOutType,
+              })).sort(),
+            })),
+          ),
+        ),
+      ),
+    ),
+  };
+}
+
+function same(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 export type TexEditReview = {
@@ -104,33 +217,81 @@ export type TexEditReview = {
   diff: BarDiff;
 };
 
-/** AI 改谱输出的完整关卡：解析 → tempo 保留 → 结构统计 */
-export function reviewTexEdit(before: string, after: string): TexEditReview {
+/** Compare parsed musical semantics; note equality is opt-in for repositioning. */
+export function reviewTexEdit(
+  before: string,
+  after: string,
+  policy: TexEditPolicy = 'arrange',
+): TexEditReview {
   const issues: string[] = [];
-
-  const parse = checkAlphaTexParses(after);
-  if (!parse.ok) issues.push(`输出不可解析：${parse.error}`);
+  let original: alphaTab.model.Score | undefined;
+  let candidate: alphaTab.model.Score | undefined;
+  try { original = readScore(before); }
+  catch (e) { issues.push(`原谱不可解析：${(e as Error).message}`); }
+  try { candidate = readScore(after); }
+  catch (e) { issues.push(`输出不可解析：${(e as Error).message}`); }
 
   const tempoBefore = extractTempoMarkers(before);
   const tempoAfter = extractTempoMarkers(after);
-  const dropped = droppedTempoMarkers(tempoBefore, tempoAfter);
-  if (dropped.length) issues.push(`\\tempo 标记被删除或改动：${dropped.join(', ')}`);
-
-  const barsBefore = splitBars(before);
-  const barsAfter = splitBars(after);
-  if (barsAfter.length !== barsBefore.length) {
-    issues.push(`小节数变化：${barsBefore.length} → ${barsAfter.length}`);
+  const barsBefore = original?.masterBars.length ?? splitBars(before).length;
+  const barsAfter = candidate?.masterBars.length ?? splitBars(after).length;
+  if (original && candidate) {
+    const a = semantics(original);
+    const b = semantics(candidate);
+    if (!same(a.tempo, b.tempo)) issues.push('\\tempo 的 BPM、所在小节或拍点发生变化（含新增/删除）');
+    if (!same(a.structure, b.structure)) issues.push('小节结构变化：小节数、拍号、弱起或反复结构不一致');
+    if (!same(a.instruments, b.instruments)) issues.push('调弦、Capo 或移调设置发生变化');
+    if (!same(a.keys, b.keys)) issues.push('调号或调号所在小节发生变化');
+    if (policy === 'reposition' && !same(a.music, b.music)) {
+      issues.push('降把位必须保留每小节/拍点的实际音高、时值、和弦及延音语义');
+    }
+    const declared = (bar: alphaTab.model.MasterBar) => bar.calculateDuration();
+    for (const masterBar of candidate.masterBars) {
+      const limit = declared(masterBar);
+      const filled = candidate.tracks.flatMap((track) =>
+        track.staves.flatMap((staff) => staff.bars[masterBar.index]?.voices ?? []),
+      ).reduce((end: number, voice) => {
+        const beats = voice?.beats ?? [];
+        return Math.max(end, beats.reduce((beatEnd, beat) =>
+          Math.max(beatEnd, beat.playbackStart + beat.playbackDuration), 0));
+      }, 0);
+      if (filled > limit) {
+        issues.push(`第 ${masterBar.index + 1} 小节装入 ${filled} ticks，超过拍号声部容量 ${limit} ticks`);
+      }
+    }
+    if (policy === 'reposition') {
+      for (const track of candidate.tracks) {
+        for (const staff of track.staves) {
+          for (const bar of staff.bars) {
+            const used = new Map<number, number>();
+            for (const voice of bar.voices) {
+              for (const beat of voice.beats) {
+                for (const note of beat.notes.filter((n) => n.isStringed)) {
+                  const start = bar.masterBar.start + beat.playbackStart;
+                  const end = start + beat.playbackDuration;
+                  const previous = used.get(note.string);
+                  if (previous !== undefined && start < previous) {
+                    issues.push('降把位产生跨声部同弦冲突');
+                  }
+                  used.set(note.string, Math.max(previous ?? 0, end));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   const diff = diffBars(before, after);
-  const verdict = parse.ok && dropped.length === 0 ? 'accept' : 'reject';
+  const verdict = issues.length === 0 ? 'accept' : 'reject';
 
   return {
     verdict,
     issues,
     stats: {
-      barsBefore: barsBefore.length,
-      barsAfter: barsAfter.length,
+      barsBefore,
+      barsAfter,
       notesBefore: countNotes(before),
       notesAfter: countNotes(after),
       tempoBefore,

@@ -24,6 +24,42 @@ export type PreprocessResult = {
   sampleRate: number;
 };
 
+/** 将 AudioBuffer 转成 22050Hz mono；可选带通只用于轻量档原曲。 */
+export async function audioBufferToSamples(
+  buffer: AudioBuffer,
+  opts: PreprocessOptions = {},
+): Promise<PreprocessResult> {
+  requireBrowser();
+  const mono = mixToMono(buffer);
+  const ratio = TARGET_SAMPLE_RATE / buffer.sampleRate;
+  const outLength = Math.max(1, Math.ceil(mono.length * ratio));
+  const ctx = new OfflineAudioContext(1, outLength, TARGET_SAMPLE_RATE);
+  const src = ctx.createBufferSource();
+  const tmp = ctx.createBuffer(1, mono.length, buffer.sampleRate);
+  tmp.copyToChannel(mono, 0);
+  src.buffer = tmp;
+  let node: AudioNode = src;
+  if (opts.bandpass) {
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = HIGHPASS_HZ;
+    hp.Q.value = 0.707;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = LOWPASS_HZ;
+    lp.Q.value = 0.707;
+    src.connect(hp);
+    hp.connect(lp);
+    node = lp;
+  }
+  node.connect(ctx.destination);
+  src.start(0);
+  const rendered = await ctx.startRendering();
+  const samples = rendered.getChannelData(0).slice();
+  if (opts.normalize !== false) normalizePeak(samples);
+  return { samples, sampleRate: TARGET_SAMPLE_RATE };
+}
+
 const TARGET_SAMPLE_RATE = 22050;
 /** 吉他最低 E2=82Hz、Drop D D2=73Hz，70Hz 安全保留；滤底鼓/嗡嗡声/DC */
 const HIGHPASS_HZ = 70;
@@ -84,37 +120,5 @@ export async function preprocessAudio(
 ): Promise<PreprocessResult> {
   requireBrowser();
   const buffer = await decodeToAudioBuffer(data);
-  const mono = mixToMono(buffer);
-
-  // 重采样（+ 可选带通）离线渲染到目标采样率
-  const ratio = TARGET_SAMPLE_RATE / buffer.sampleRate;
-  const outLength = Math.max(1, Math.ceil(mono.length * ratio));
-  const ctx = new OfflineAudioContext(1, outLength, TARGET_SAMPLE_RATE);
-  const src = ctx.createBufferSource();
-  const tmp = ctx.createBuffer(1, mono.length, buffer.sampleRate);
-  tmp.copyToChannel(mono, 0);
-  src.buffer = tmp;
-
-  let node: AudioNode = src;
-  if (opts.bandpass) {
-    // 串联两个 BiquadFilter：高通 + 低通
-    const hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = HIGHPASS_HZ;
-    hp.Q.value = 0.707;
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = LOWPASS_HZ;
-    lp.Q.value = 0.707;
-    node.connect(hp);
-    hp.connect(lp);
-    node = lp;
-  }
-  node.connect(ctx.destination);
-  src.start(0);
-  const rendered = await ctx.startRendering();
-
-  const samples = rendered.getChannelData(0).slice();
-  if (opts.normalize !== false) normalizePeak(samples);
-  return { samples, sampleRate: TARGET_SAMPLE_RATE };
+  return audioBufferToSamples(buffer, opts);
 }
